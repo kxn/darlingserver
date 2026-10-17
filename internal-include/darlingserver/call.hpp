@@ -53,6 +53,7 @@ namespace DarlingServer {
 		static DarlingServer::Log rpcReplyLog;
 
 		static void sendReply(Message&& reply);
+		int _checkout(int& execListener, bool executingMacho, bool disclaim);
 
 	public:
 		Call(std::shared_ptr<Thread> thread, Address replyAddress, dserver_rpc_callhdr_t* callHeader);

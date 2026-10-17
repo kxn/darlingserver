@@ -1,5 +1,6 @@
 #include <darlingserver/duct-tape/stubs.h>
 #include <darlingserver/duct-tape/hooks.internal.h>
+#include <darlingserver/duct-tape/processor.h>
 
 #include <kern/processor.h>
 #include <kern/kalloc.h>
@@ -26,6 +27,32 @@ processor_t master_processor;
 // Linux functions
 int get_nprocs(void);
 int get_nprocs_conf(void);
+
+cpu_subtype_t dtape_processor_cpu_subtype(void) {
+#if __x86_64__
+	unsigned a, b, c, d;
+	__asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0), "c"(0));
+	if (a < 7) return CPU_SUBTYPE_X86_64_ALL;
+	__asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+	// pclmul, ssse3, fma, cx16, sse4.1/4.2, movbe, popcnt, aes,
+	// xsave/osxsave, avx, f16c and rdrand (the x86_64h feature set).
+	const unsigned leaf1 = 0x7ed83202;
+	if ((c & leaf1) != leaf1) return CPU_SUBTYPE_X86_64_ALL;
+	unsigned xcr0_low, xcr0_high;
+	// OSXSAVE was checked above: XGETBV is legal and XMM/YMM must be enabled.
+	__asm__ volatile("xgetbv" : "=a"(xcr0_low), "=d"(xcr0_high) : "c"(0));
+	if ((xcr0_low & 6) != 6) return CPU_SUBTYPE_X86_64_ALL;
+	__asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(7), "c"(0));
+	if ((b & 0x128) != 0x128) return CPU_SUBTYPE_X86_64_ALL; // bmi1, avx2, bmi2
+	__asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000000), "c"(0));
+	if (a < 0x80000001) return CPU_SUBTYPE_X86_64_ALL;
+	__asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000001), "c"(0));
+	if ((c & 0x21) != 0x21) return CPU_SUBTYPE_X86_64_ALL; // lahf_sahf, lzcnt
+	return CPU_SUBTYPE_X86_64_H;
+#else
+	return CPU_SUBTYPE_I386_ALL;
+#endif
+}
 
 void dtape_processor_init(void) {
 	simple_lock_init(&processor_list_lock, 0);
@@ -94,7 +121,7 @@ kern_return_t processor_info(processor_t processor, processor_flavor_t flavor, h
 #if __x86_64__ || __i386__
 			info->cpu_type = CPU_TYPE_X86;
 #if __x86_64__
-			info->cpu_subtype = CPU_SUBTYPE_X86_64_ALL;
+			info->cpu_subtype = dtape_processor_cpu_subtype();
 #else
 			info->cpu_subtype = CPU_SUBTYPE_I386_ALL;
 #endif

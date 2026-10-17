@@ -643,6 +643,34 @@ calls = [
 		('message_count', 'uint64_t'),
 		('fd', '@fd'),
 	], UNMANAGED_CALL),
+
+	# Append only: all existing packaged-client call numbers remain stable.
+	('checkout_disclaim', [
+		('exec_listener_pipe', '@fd'),
+		('executing_macho', 'bool'),
+	], []),
+
+	('mac_syscall', [
+		('policy', 'const char*', 'uint64_t'),
+		('operation', 'int32_t'),
+		('arguments', 'void*', 'uint64_t'),
+	], [('bsd_error', 'int32_t')]),
+
+	# Keep libproc's PID version consistent with Mach audit tokens. Append this
+	# call so existing packaged clients retain all their previous call numbers.
+	('process_get_generation', [
+		('pid', 'int32_t'),
+	], [('generation', 'uint32_t')]),
+
+	# Internal versioned registration by the source kernel implementing actual
+	# file creation/rename marking, exec checks, and xattr mutation checks.
+	('quarantine_kernel_ready', [('capabilities', 'uint32_t')], []),
+
+	# Append only: a real Linux event channel for the legacy device ABI.
+	('fsevents_open', [('flags', 'int32_t')], [('fd', '@fd')]),
+	('fsevents_ioctl', [
+		('fd', '@fd'), ('command', 'uint32_t'), ('argument', 'uint64_t'),
+	], [('fd', '@fd')]),
 ]
 
 ALLOWED_PRIVATE_TYPES = [

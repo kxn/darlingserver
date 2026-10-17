@@ -285,6 +285,8 @@ struct DTapeHooks {
 			memory_region_info->start_address = info.startAddress;
 			memory_region_info->page_count = info.pageCount;
 			memory_region_info->map_offset = info.mapOffset;
+			memory_region_info->file_device = info.fileDevice;
+			memory_region_info->file_inode = info.fileInode;
 			protection = info.protection;
 			memory_region_info->shared = info.shared;
 		} catch (...) {
@@ -302,6 +304,14 @@ struct DTapeHooks {
 		if (protection & PROT_EXEC) {
 			memory_region_info->protection = (dtape_memory_protection_t)(memory_region_info->protection | dtape_memory_protection_execute);
 		}
+		return true;
+	};
+
+	static bool dtape_hook_file_identity(int fd, uint64_t* device, uint64_t* inode) {
+		struct stat info;
+		if (fstat(fd, &info) < 0) return false;
+		*device = info.st_dev;
+		*inode = info.st_ino;
 		return true;
 	};
 
@@ -419,6 +429,7 @@ struct DTapeHooks {
 		.task_lookup_eternal = dtape_hook_task_lookup_eternal,
 		.task_get_memory_info = dtape_hook_task_get_memory_info,
 		.task_get_memory_region_info = dtape_hook_task_get_memory_region_info,
+		.file_identity = dtape_hook_file_identity,
 		.task_allocate_pages = dtape_hook_task_allocate_pages,
 		.task_free_pages = dtape_hook_task_free_pages,
 		.task_map_file = dtape_hook_task_map_file,

@@ -26,10 +26,16 @@
 
 #include <fstream>
 #include <regex>
+#include <sstream>
+#include <atomic>
 
 #include <sys/mman.h>
+#include <sys/sysmacros.h>
 
 static DarlingServer::Log processLog("process");
+// Like XNU's nextpidversion, this changes on both fork and successful exec.
+// The registry EternalID instead identifies the whole process lifetime.
+static std::atomic<uint32_t> nextPIDVersion{1};
 
 DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int pipe):
 	_pid(id),
@@ -42,6 +48,24 @@ DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int
 	}
 
 	_pidfd = std::make_shared<FD>(pidfd);
+	// Match libproc's existing Darwin unique-ID representation, using the real
+	// Linux process birth time and the PID in the client's namespace. Never look
+	// up a responsible PID later: PID reuse must not substitute a new process.
+	std::ifstream statFile("/proc/" + std::to_string(id) + "/stat");
+	std::string statLine;
+	std::getline(statFile, statLine);
+	auto endComm = statLine.rfind(')');
+	if (endComm == std::string::npos) {
+		throw std::system_error(ESRCH, std::generic_category(), "Missing process birth record");
+	}
+	std::istringstream statFields(statLine.substr(endComm + 1));
+	std::string field;
+	for (int number = 3; number <= 22; ++number) {
+		if (!(statFields >> field)) {
+			throw std::system_error(ESRCH, std::generic_category(), "Incomplete process birth record");
+		}
+	}
+	_uniqueID = (std::stoull(field) << 16) | (_nspid & 0xffff);
 
 	// we could use stat instead of status, but it's more complicated with comm potentially getting in the way of parsing (it can include whitespace and parentheses)
 	std::ifstream statusFile("/proc/" + std::to_string(id) + "/status");
@@ -80,6 +104,11 @@ DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int
 
 		// inherit groups from parent process
 		_groups = parentProcess->_groups;
+		_responsibility = parentProcess->_responsibility;
+		_sandboxState = parentProcess->_sandboxState;
+		_sandboxPolicy = parentProcess->_sandboxPolicy;
+		_quarantineState = parentProcess->_quarantineState;
+		_quarantineKernelCapabilities = parentProcess->_quarantineKernelCapabilities;
 	}
 
 	// NOTE: see thread.cpp for why it's okay to use `this` here
@@ -125,6 +154,11 @@ DarlingServer::EternalID DarlingServer::Process::eternalID() const {
 
 void DarlingServer::Process::_setEternalID(EternalID eid) {
 	_eid = eid;
+	_pidVersion = nextPIDVersion.fetch_add(1, std::memory_order_relaxed);
+	dtape_task_set_process_generation(_dtapeTask, eid, _pidVersion);
+	if (_responsibility.pid == 0) {
+		_responsibility = {_nspid, _uniqueID, eid};
+	}
 };
 
 std::vector<std::shared_ptr<DarlingServer::Thread>> DarlingServer::Process::threads() const {
@@ -317,6 +351,9 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		auto oldTask = _dtapeTask;
 		auto newTask = dtape_task_create(oldTask, _nspid, this, static_cast<dserver_rpc_architecture_t>(_architecture));
 		_dtapeTask = newTask;
+		_quarantineKernelCapabilities = 0;
+		_pidVersion = nextPIDVersion.fetch_add(1, std::memory_order_relaxed);
+		dtape_task_set_process_generation(_dtapeTask, _eid, _pidVersion);
 
 		// now replace the main thread's duct-taped thread with a new one
 		auto oldThread = mainThread->_dtapeThread;
@@ -375,12 +412,22 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 	}
 };
 
-void DarlingServer::Process::setPendingReplacement() {
+void DarlingServer::Process::setPendingReplacement(bool disclaim) {
 	std::unique_lock lock(_rwlock);
 
 	processLog.info() << "Process " << id() << " (" << nsid() << ") is now pending replacement" << processLog.endLog;
 
 	_pendingReplacement = true;
+	if (disclaim) {
+		// The close-on-exec pipe has confirmed a successful exec. Failed execs
+		// never arrive here and cannot change the old process's responsibility.
+		_responsibility = {_nspid, _uniqueID, _eid};
+	}
+};
+
+DarlingServer::Process::Responsibility DarlingServer::Process::responsibility() const {
+	std::shared_lock lock(_rwlock);
+	return _responsibility;
 };
 
 void DarlingServer::Process::registerKqchan(std::shared_ptr<Kqchan> kqchan) {
@@ -465,7 +512,7 @@ DarlingServer::Process::MemoryInfo DarlingServer::Process::memoryInfo() const {
 	return info;
 };
 
-static const std::regex memoryRegionEntryRegex("([0-9a-fA-F]+)\\-([0-9a-fA-F]+)\\s+((?:r|w|x|p|s|\\-)+)\\s+([0-9a-fA-F]+)");
+static const std::regex memoryRegionEntryRegex("([0-9a-fA-F]+)\\-([0-9a-fA-F]+)\\s+((?:r|w|x|p|s|\\-)+)\\s+([0-9a-fA-F]+)\\s+([0-9a-fA-F]+):([0-9a-fA-F]+)\\s+([0-9]+)");
 
 DarlingServer::Process::MemoryRegionInfo DarlingServer::Process::memoryRegionInfo(uintptr_t address) const {
 	if (isDead()) {
@@ -496,6 +543,8 @@ DarlingServer::Process::MemoryRegionInfo DarlingServer::Process::memoryRegionInf
 		info.pageCount = (endAddress - info.startAddress) / sysconf(_SC_PAGESIZE);
 
 		info.mapOffset = std::stoul(match[4].str(), nullptr, 16);
+		info.fileDevice = makedev(std::stoul(match[5].str(), nullptr, 16), std::stoul(match[6].str(), nullptr, 16));
+		info.fileInode = std::stoull(match[7].str());
 
 		auto perms = match[3].str();
 
@@ -580,21 +629,25 @@ std::shared_ptr<DarlingServer::Thread> DarlingServer::Process::_pickS2CThread(vo
 		return Thread::currentThread();
 	}
 
-	// otherwise, pick any thread to perform the call
-
-	std::shared_ptr<Thread> thread = nullptr;
-
+	// Thread objects can outlive their Linux thread while an interrupted call
+	// unwinds. A successful weak_ptr::lock() does not prove that the thread can
+	// receive an S2C request. Snapshot the candidates without nesting the process
+	// lock with their individual locks (or their destructors).
+	std::vector<std::shared_ptr<Thread>> candidates;
 	{
 		std::shared_lock lock(_rwlock);
 		for (auto& [id, weakThread]: _threads) {
-			thread = weakThread.lock();
-			if (thread) {
-				break;
-			}
+			if (auto thread = weakThread.lock()) candidates.push_back(std::move(thread));
 		}
 	}
-
-	return thread;
+	std::shared_ptr<Thread> fallback;
+	for (auto& thread: candidates) {
+		if (thread->isDead()) continue;
+		// A thread already waiting for a server reply needs no signal roundtrip.
+		if (thread->activeCall()) return thread;
+		if (!fallback) fallback = thread;
+	}
+	return fallback;
 };
 
 std::string DarlingServer::Process::executablePath() const {

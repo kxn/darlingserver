@@ -47,6 +47,8 @@ typedef struct dtape_memory_region_info {
 	uintptr_t start_address;
 	uint64_t page_count;
 	uint64_t map_offset;
+	uint64_t file_device;
+	uint64_t file_inode;
 	dtape_memory_protection_t protection;
 	bool shared;
 } dtape_memory_region_info_t;

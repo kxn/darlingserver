@@ -44,6 +44,13 @@ void dtape_task_init(void) {
 	}
 };
 
+void dtape_task_set_process_generation(dtape_task_t* task, dtape_eternal_id_t identity, uint32_t pid_version) {
+	task_lock(&task->xnu_task);
+	task->p_ident.eid = identity;
+	task->xnu_task.audit_token.val[7] = pid_version;
+	task_unlock(&task->xnu_task);
+}
+
 dtape_task_t* dtape_task_create(dtape_task_t* parent_task, uint32_t nsid, void* context, dserver_rpc_architecture_t architecture) {
 	if (parent_task == NULL && nsid == 0 && kernel_task) {
 		dtape_task_t* task = dtape_task_for_xnu_task(kernel_task);
@@ -746,6 +753,10 @@ task_t proc_task(void* p) {
 
 struct proc_ident proc_ident(void* p) {
 	return ((dtape_task_t*)p)->p_ident;
+};
+
+int proc_pidversion(void* p) {
+	return (int)((dtape_task_t*)p)->xnu_task.audit_token.val[7];
 };
 
 //

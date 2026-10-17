@@ -21,6 +21,7 @@
 #include <darlingserver/call.hpp>
 #include <darlingserver/server.hpp>
 #include <sys/uio.h>
+#include <cstring>
 
 #include <darlingserver/logging.hpp>
 #include <darlingserver/duct-tape.h>
@@ -28,6 +29,8 @@
 #include <sys/fcntl.h>
 #include <sys/syscall.h>
 #include <darlingserver/kqchan.hpp>
+#include <darlingserver/sandbox-policy.hpp>
+#include <darlingserver/fsevents-device.hpp>
 
 static DarlingServer::Log callLog("calls");
 
@@ -309,32 +312,32 @@ void DarlingServer::Call::Checkin::processCall() {
 	_sendReply(code);
 };
 
-void DarlingServer::Call::Checkout::processCall() {
+int DarlingServer::Call::_checkout(int& execListener, bool executingMacho, bool disclaim) {
 	int code = 0;
 
 	if (auto thread = _thread.lock()) {
 		if (auto process = thread->process()) {
-			if (_body.exec_listener_pipe >= 0) {
+			if (execListener >= 0) {
 				// this is actually an execve;
 				// let's monitor the FD we got
 
 				// make it non-blocking
-				int flags = fcntl(_body.exec_listener_pipe, F_GETFL);
+				int flags = fcntl(execListener, F_GETFL);
 				if (flags < 0) {
 					code = -errno;
 				} else {
 					flags |= O_NONBLOCK;
-					if (fcntl(_body.exec_listener_pipe, F_SETFL, flags) < 0) {
+					if (fcntl(execListener, F_SETFL, flags) < 0) {
 						code = -errno;
 					} else {
 						// now monitor it
-						auto fd = std::make_shared<FD>(_body.exec_listener_pipe);
-						_body.exec_listener_pipe = -1; // the FD instance now owns the descriptor
+						auto fd = std::make_shared<FD>(execListener);
+						execListener = -1; // the FD instance now owns the descriptor
 
-						auto replacingWithDarlingProcess = _body.executing_macho;
+						auto replacingWithDarlingProcess = executingMacho;
 
 						std::weak_ptr<Process> weakProcess = process;
-						Server::sharedInstance().addMonitor(std::make_shared<Monitor>(fd, Monitor::Event::HangUp, false, true, [fd, weakProcess, replacingWithDarlingProcess](std::shared_ptr<Monitor> monitor, Monitor::Event events) {
+						Server::sharedInstance().addMonitor(std::make_shared<Monitor>(fd, Monitor::Event::HangUp, false, true, [fd, weakProcess, replacingWithDarlingProcess, disclaim](std::shared_ptr<Monitor> monitor, Monitor::Event events) {
 							Server::sharedInstance().removeMonitor(monitor);
 
 							auto process = weakProcess.lock();
@@ -355,7 +358,7 @@ void DarlingServer::Call::Checkout::processCall() {
 							if (result == 0) {
 								// the execve succeeded
 								if (replacingWithDarlingProcess) {
-									process->setPendingReplacement();
+									process->setPendingReplacement(disclaim);
 								} else {
 									// the Darling process was replaced with a non-Darling process
 									// treat it like death
@@ -384,7 +387,250 @@ void DarlingServer::Call::Checkout::processCall() {
 	// (otherwise, we would attempt to send it through the thread, which is now dead)
 	_thread.reset();
 
-	_sendReply(code);
+	return code;
+};
+
+void DarlingServer::Call::Checkout::processCall() {
+    int code = _checkout(_body.exec_listener_pipe, _body.executing_macho, false);
+    _sendReply(code);
+};
+
+void DarlingServer::Call::CheckoutDisclaim::processCall() {
+    int code = _checkout(_body.exec_listener_pipe, _body.executing_macho, true);
+    _sendReply(code);
+};
+
+void DarlingServer::Call::QuarantineKernelReady::processCall() {
+    int code = -ESRCH;
+    auto thread = _thread.lock();
+    auto process = thread ? thread->process() : nullptr;
+    if (process) {
+        if (_body.capabilities != 0x0001000f) code = -EINVAL;
+        else {
+            std::unique_lock lock(process->_rwlock);
+            process->_quarantineKernelCapabilities = _body.capabilities;
+            code = 0;
+        }
+    }
+    _sendReply(code);
+};
+
+void DarlingServer::Call::ProcessGetGeneration::processCall() {
+    int code = -ESRCH;
+    uint32_t generation = 0;
+    auto thread = _thread.lock();
+    auto process = thread ? thread->process() : nullptr;
+    if (process) {
+        if (_body.pid <= 0) code = -EINVAL;
+        else {
+            auto entry = processRegistry().lookupEntryByNSID(_body.pid);
+            auto target = entry ? *entry : nullptr;
+            if (target && !target->isDead()) {
+                std::shared_lock lock(target->_rwlock);
+                generation = target->_pidVersion;
+                code = 0;
+            }
+        }
+    }
+    _sendReply(code, generation);
+};
+
+void DarlingServer::Call::MacSyscall::processCall() {
+    int code = -ESRCH;
+    auto thread = _thread.lock();
+    auto process = thread ? thread->process() : nullptr;
+    if (process) {
+        std::string policy;
+        char ch = 0;
+        code = 0;
+        for (size_t i = 0; i < 32; ++i) {
+            if (!process->readMemory(_body.policy + i, &ch, 1)) { code = -EFAULT; break; }
+            if (!ch) break;
+            policy += ch;
+        }
+        // Preserve Darwin policy errno separately from Linux RPC transport.
+        if (!code && ch) code = -63; // ENAMETOOLONG
+        if (!code && policy == "Sandbox") {
+            if (_body.operation == 0) {
+                // Pinned Intel sandbox_apply_container ABI: data, byte count,
+                // optional container string, container string byte count.
+                // Copy the upload once before parsing it; guest memory is not
+                // stable across separate validation and execution passes.
+                uint64_t upload[4] = {};
+                if (!process->readMemory(_body.arguments, upload, sizeof(upload))) code = -EFAULT;
+                if (!code && (upload[2] || upload[3])) code = -45; // containers not implemented
+                if (!code && (!upload[1] || upload[1] > 1024 * 1024)) code = -EINVAL;
+                if (!code && (!upload[0] || upload[0] > UINT64_MAX - upload[1])) code = -EFAULT;
+                if (!code) {
+                    std::vector<uint8_t> bytes(upload[1]);
+                    if (!process->readMemory(upload[0], bytes.data(), bytes.size())) code = -EFAULT;
+                    else {
+                        std::string error;
+                        auto decoded = Sandbox::Policy::parse(std::move(bytes), error);
+                        if (!decoded) {
+                            callLog.debug() << "Sandbox upload rejected: " << error;
+                            code = -EINVAL;
+                        } else if (decoded->allowsAllOperations()) {
+                            std::unique_lock lock(process->_rwlock);
+                            if (process->_sandboxState != Process::SandboxState::Unconfined) code = -EPERM;
+                            else {
+                                process->_sandboxPolicy = std::move(decoded);
+                                process->_sandboxState = Process::SandboxState::UnrestrictedProfile;
+                                callLog.info() << "Attached native Sandbox policy proven unrestricted for all operations";
+                            }
+                        } else {
+                            callLog.error() << "Sandbox upload decoded: " << decoded->nodeCount()
+                                << " nodes; attachment refused because operation enforcement is unavailable";
+                            // Keep process state unchanged. A decoded graph is
+                            // not a successfully applied Sandbox policy.
+                            code = -45;
+                        }
+                    }
+                }
+                _sendReply(0, -code);
+                return;
+            }
+            // Query actual process state. Restrictive policies, extensions,
+            // approvals and target-credential POSIX access remain unsupported.
+            if (_body.operation != 2) code = -45;
+            uint64_t args[20] = {};
+            if (!code && !process->readMemory(_body.arguments, args, sizeof(args))) code = -EFAULT;
+            if (!code && !args[0]) code = -EFAULT;
+            if (!code && args[1] > INT32_MAX) code = -EINVAL;
+            if (!code && (args[5] & ~uint64_t(0x4000007b))) code = -EINVAL;
+            if (!code && (args[5] & 0x60)) code = -45; // POSIX checks are not Sandbox state queries
+            for (unsigned i = 7; !code && i < 20; ++i) if (args[i]) code = -EINVAL;
+            if (!code && !(args[5] & 0x40000000) && args[6]) code = -EINVAL;
+            auto target = process;
+            if (!code && args[1]) {
+                auto entry = processRegistry().lookupEntryByNSID(args[1]);
+                target = entry ? *entry : nullptr;
+            }
+            if (!code && (!target || target->isDead())) code = -ESRCH;
+            auto readString = [&](uintptr_t address, size_t limit, std::string& value) {
+                for (size_t i = 0; i < limit; ++i) {
+                    char byte;
+                    if (!process->readMemory(address + i, &byte, 1)) return -EFAULT;
+                    if (!byte) return 0;
+                    value += byte;
+                }
+                return -63; // Darwin ENAMETOOLONG
+            };
+            std::string operation;
+            if (!code && args[2]) {
+                code = readString(args[2], 256, operation);
+                if (!code && operation.empty()) code = -EINVAL;
+            }
+            bool scalar = false, compound = false, string = false;
+            if (!code) {
+                switch (args[3]) {
+                    case 0: if (args[4]) code = -EINVAL; break;
+                    case 240: case 65: case 75: case 52: scalar = true; break;
+                    case 35: case 241: compound = true; break;
+                    case 28: break; // descriptor value is opaque to an unconfined-state query
+                    case 1: case 6: case 7: case 25: case 27:
+                    case 33: case 34: case 50: case 19: case 45: case 5: case 69:
+                        string = true; break;
+                    default: code = -EINVAL;
+                }
+            }
+            if (!code && scalar && args[4] > UINT32_MAX) code = -EINVAL;
+            uint64_t pair[2] = {};
+            if (!code && compound && !process->readMemory(args[4], pair, sizeof(pair))) code = -EFAULT;
+            if (!code && compound && args[3] == 35) { args[4] = pair[0]; string = true; }
+            std::string argument;
+            if (!code && string) code = readString(args[4], 4096, argument);
+            if (!code) {
+                Process::SandboxState state;
+                std::shared_ptr<const Sandbox::Policy> attached;
+                {
+                    std::shared_lock lock(target->_rwlock);
+                    state = target->_sandboxState;
+                    attached = target->_sandboxPolicy;
+                    if ((args[5] & 0x40000000) && args[6] != target->_pidVersion) code = -ESRCH;
+                }
+                if (code) { _sendReply(0, -code); return; }
+                if (state == Process::SandboxState::Unsupported) code = -45;
+                else {
+                    uint64_t decision = 0;
+                    if (state == Process::SandboxState::UnrestrictedProfile) {
+                        if (!attached || !attached->allowsAllOperations()) code = -45;
+                        else if (!args[2]) decision = 1; // a real profile is attached
+                        else if (attached->evaluate(operation, Sandbox::Context{}) != Sandbox::Decision::Allow) code = -EINVAL;
+                    }
+                    if (!code && !process->writeMemory(args[0], &decision, sizeof(decision))) code = -EFAULT;
+                }
+            }
+        } else if (!code && policy == "Quarantine" && _body.operation == 87) {
+            // Native nine-slot setprocinfo ABI. Only the actual flags-6 policy
+            // implemented by the paired source VFS is supported here; do not
+            // turn unknown approval/tracking/exclusion requests into success.
+            uint64_t args[9] = {};
+            if (!process->readMemory(_body.arguments, args, sizeof(args))) code = -EFAULT;
+            if (!code && (!args[1] || args[2] > 1024 || args[5] > 2048 || args[7] > 2048 || args[8] > 0x1fff)) code = -EINVAL;
+            if (!code && (args[0] || args[5] || args[6] || args[7] || args[8] != 6 || args[2] > 64)) code = -45;
+            std::string identifier;
+            if (!code) {
+                for (size_t i = 0; i < 256; ++i) {
+                    char byte;
+                    if (!process->readMemory(args[1]+i, &byte, 1)) { code = -EFAULT; break; }
+                    if (!byte) break;
+                    identifier += byte;
+                    if (i == 255) code = -63;
+                }
+            }
+            std::vector<uint8_t> metadata;
+            if (!code && args[2]) {
+                metadata.resize(args[2]);
+                if (!process->readMemory(args[3], metadata.data(), metadata.size())) code = -EFAULT;
+            }
+            if (!code) {
+                std::unique_lock lock(process->_rwlock);
+                if (process->_quarantineKernelCapabilities != 0x0001000f) code = -45;
+                else if (process->_quarantineState &&
+                    (process->_quarantineState->identifier != identifier || process->_quarantineState->metadata != metadata)) code = -45;
+                else process->_quarantineState = std::make_shared<const Process::QuarantineState>(Process::QuarantineState{std::move(identifier), std::move(metadata), 6});
+            }
+        } else if (!code && policy == "Quarantine" && _body.operation == 84) {
+            // Native getprocinfo writes lengths and flags back to its eight
+            // argument slots, plus the three caller-provided output buffers.
+            std::shared_ptr<const Process::QuarantineState> state;
+            { std::shared_lock lock(process->_rwlock); state = process->_quarantineState; }
+            if (!state) code = -93; // actual absent process Quarantine label
+            uint64_t args[8] = {};
+            if (!code && !process->readMemory(_body.arguments, args, sizeof(args))) code = -EFAULT;
+            if (!code && (!args[1] || !args[3] || !args[5])) code = -EINVAL;
+            if (!code) {
+                args[0] = state->identifier.size(); args[2] = state->metadata.size(); args[4] = 0; args[6] = state->flags;
+                if (!process->writeMemory(_body.arguments, args, sizeof(args))) code = -EFAULT;
+                if (!code && args[0] && !process->writeMemory(args[1], state->identifier.data(), args[0])) code = -EFAULT;
+                if (!code && args[2] && !process->writeMemory(args[3], state->metadata.data(), args[2])) code = -EFAULT;
+            }
+        } else if (!code && policy != "Quarantine") code = -103; // ENOPOLICY
+        else if (!code && _body.operation != 180) code = -45; // ENOTSUP
+        else if (!code) {
+            // The native libquarantine query SPI passes five 64-bit slots:
+            // pid, optional pid output, optional unique-ID output, reserved x2.
+            uint64_t args[5];
+            if (!process->readMemory(_body.arguments, args, sizeof(args))) code = -EFAULT;
+            else if (args[0] > INT32_MAX) code = -EINVAL;
+            else if (args[3] || args[4]) code = -45;
+            else {
+                auto target = process;
+                if (args[0]) {
+                    auto entry = processRegistry().lookupEntryByNSID(args[0]);
+                    target = entry ? *entry : nullptr;
+                }
+                if (!target || target->isDead()) code = -ESRCH;
+                else {
+                    auto info = target->responsibility();
+                    if (args[1] && !process->writeMemory(args[1], &info.pid, sizeof(info.pid))) code = -EFAULT;
+                    if (!code && args[2] && !process->writeMemory(args[2], &info.uniqueID, sizeof(info.uniqueID))) code = -EFAULT;
+                }
+            }
+        }
+    }
+    _sendReply(0, -code);
 };
 
 void DarlingServer::Call::VchrootPath::processCall() {
@@ -769,6 +1015,55 @@ void DarlingServer::Call::InterruptExit::processCall() {
 		}
 	}
 };
+
+void DarlingServer::Call::FseventsOpen::processCall() {
+    int result=-ESRCH;
+    if (auto thread=_thread.lock()) if (auto process=thread->process()) {
+        // This initial backend covers the actual virtual-root tree. External
+        // SystemRoot aliases need additional roots before general CI promotion.
+        try { result=FSEvents::openDevice({{process->vchrootPath(),"/"}},_body.flags); }
+        catch (const std::bad_alloc&) { result=-ENOMEM; }
+        catch (...) { result=-EIO; }
+    }
+    _sendReply(result<0?result:0,result<0?-1:result);
+}
+
+void DarlingServer::Call::FseventsIoctl::processCall() {
+    int result=-ESRCH,output=-1;
+    auto thread=_thread.lock();auto process=thread?thread->process():nullptr;
+    if (process) {
+        try {
+            if (!FSEvents::isDevice(_body.fd)) result=-ENOTTY;
+            else switch (_body.command) {
+                case 0x80187301: { // FSEVENTS_CLONE, x86_64 24-byte structure
+                    struct Clone { uint64_t actions;int32_t count,depth;uint64_t output; } args{};
+                    if (!process->readMemory(_body.argument,&args,sizeof args)) { result=-EFAULT;break; }
+                    if (args.count<1 || args.count>64 || args.depth<1 || args.depth>65536) { result=-EINVAL;break; }
+                    std::vector<int8_t> actions(args.count);
+                    if (!process->readMemory(args.actions,actions.data(),actions.size())) { result=-EFAULT;break; }
+                    result=FSEvents::cloneDevice(_body.fd,actions,args.depth);
+                    if (result>=0) { output=result;result=0; }
+                    break;
+                }
+                case 0x800c7364: { // packed FSEVENTS_DEVICE_FILTER (exclusion list)
+                    uint8_t bytes[12];uint32_t count;uint64_t address;
+                    if (!process->readMemory(_body.argument,bytes,sizeof bytes)) { result=-EFAULT;break; }
+                    std::memcpy(&count,bytes,4);std::memcpy(&address,bytes+4,8);
+                    if (count>256) { result=-EINVAL;break; }
+                    std::vector<uint32_t> devices(count);
+                    if (count && !process->readMemory(address,devices.data(),count*4)) { result=-EFAULT;break; }
+                    result=FSEvents::filterDevices(_body.fd,devices);break;
+                }
+                case 0x20007365: result=FSEvents::setCompact(_body.fd);break;
+                case 0x20007366: result=FSEvents::setExtended(_body.fd);break;
+                case 0x40087367: result=-ENOTSUP;break; // persistent event IDs not provided by inotify
+                default: result=-ENOTTY;break;
+            }
+        } catch (const std::bad_alloc&) { result=-ENOMEM; }
+        catch (...) { result=-EIO; }
+    }
+    _sendReply(result,output);
+}
 
 void DarlingServer::Call::ConsoleOpen::processCall() {
 	static Log consoleLog("console");

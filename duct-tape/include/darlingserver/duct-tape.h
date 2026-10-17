@@ -52,6 +52,7 @@ typedef void (*dtape_kqchan_mach_port_notification_callback_f)(void* context);
  * An @p nsid value of `0` indicates the task being created is the kernel task.
  */
 dtape_task_t* dtape_task_create(dtape_task_t* parent_task, uint32_t nsid, void* context, dserver_rpc_architecture_t architecture);
+void dtape_task_set_process_generation(dtape_task_t* task, dtape_eternal_id_t identity, uint32_t pid_version);
 dtape_thread_t* dtape_thread_create(dtape_task_t* task, uint64_t nsid, void* context);
 dtape_kqchan_mach_port_t* dtape_kqchan_mach_port_create(dtape_task_t* owning_task, uint32_t port, uint64_t receive_buffer, uint64_t receive_buffer_size, uint64_t saved_filter_flags, dtape_kqchan_mach_port_notification_callback_f notification_callback, void* context);
 dtape_semaphore_t* dtape_semaphore_create(dtape_task_t* owning_task, int initial_value);

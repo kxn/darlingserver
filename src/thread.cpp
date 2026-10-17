@@ -1010,6 +1010,10 @@ static DarlingServer::Log s2cLog("s2c");
 std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message&& call, dserver_s2c_msgnum_t expectedReplyNumber, size_t expectedReplySize) {
 	std::optional<Message> reply = std::nullopt;
 	bool usingInterrupt = false;
+	{
+		std::shared_lock lock(_rwlock);
+		if (_dead || _terminating) return std::nullopt;
+	}
 
 	// make sure we're the only one performing an S2C call on this thread
 	if (!dtape_semaphore_down_simple(_s2cPerformSempahore)) {
@@ -1021,6 +1025,14 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 
 	{
 		std::unique_lock lock(_rwlock);
+
+		// Selection and acquisition are separate: reject a thread that exited
+		// while this caller waited for another S2C operation to finish.
+		if (_dead || _terminating) {
+			lock.unlock();
+			dtape_semaphore_up(_s2cPerformSempahore);
+			return std::nullopt;
+		}
 
 		if (!_activeCall) {
 			// signal the thread that we want to perform an S2C call and wait for it to give us the green light

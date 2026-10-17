@@ -3819,7 +3819,9 @@ ipc_kmsg_copyin_body(
 				goto clean_message;
 			}
 
-			if ((size >= MSG_OOL_SIZE_SMALL) &&
+			// Empty OOL descriptors allocate no VM space, including when the
+			// userspace backend disables the small kalloc-copy optimization.
+			if (size != 0 && (size >= MSG_OOL_SIZE_SMALL) &&
 			    (daddr->out_of_line.copy == MACH_MSG_PHYSICAL_COPY) &&
 			    !(daddr->out_of_line.deallocate)) {
 				/*

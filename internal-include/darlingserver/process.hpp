@@ -41,6 +41,7 @@ namespace DarlingServer {
 	class Thread;
 	class Server;
 	class Call;
+	namespace Sandbox { class Policy; }
 
 	class Process: public Loggable, public std::enable_shared_from_this<Process> {
 		friend class Thread;
@@ -75,7 +76,19 @@ namespace DarlingServer {
 			uint64_t regionCount;
 		};
 
+		// Darwin Sandbox state is separate from Linux credentials and MAC rules.
+		// Only graphs proven to permit every operation can currently attach.
+		enum class SandboxState { Unconfined, UnrestrictedProfile, Unsupported };
+
+		struct Responsibility {
+			pid_t pid = 0;
+			uint64_t uniqueID = 0;
+			EternalID generation = EternalIDInvalid;
+		};
+
 		struct MemoryRegionInfo {
+			uint64_t fileDevice;
+			uint64_t fileInode;
 			uintptr_t startAddress;
 			uint64_t pageCount;
 			int protection;
@@ -86,7 +99,19 @@ namespace DarlingServer {
 	private:
 		pid_t _pid;
 		pid_t _nspid;
-		EternalID _eid;
+		EternalID _eid = EternalIDInvalid;
+		uint32_t _pidVersion = 0;
+		struct QuarantineState {
+			std::string identifier;
+			std::vector<uint8_t> metadata;
+			uint32_t flags;
+		};
+		std::shared_ptr<const QuarantineState> _quarantineState;
+		uint32_t _quarantineKernelCapabilities = 0;
+		SandboxState _sandboxState = SandboxState::Unconfined;
+		std::shared_ptr<const Sandbox::Policy> _sandboxPolicy;
+		uint64_t _uniqueID = 0;
+		Responsibility _responsibility;
 		std::shared_ptr<FD> _pidfd;
 		mutable std::shared_mutex _rwlock;
 		std::unordered_map<uint64_t, std::weak_ptr<Thread>> _threads;
@@ -172,7 +197,8 @@ namespace DarlingServer {
 		bool writeMemory(uintptr_t remoteAddress, const void* localBuffer, size_t length, int* errorCode = nullptr) const;
 
 		void notifyCheckin(Architecture architecture);
-		void setPendingReplacement();
+		void setPendingReplacement(bool disclaim = false);
+		Responsibility responsibility() const;
 
 		void registerKqchan(std::shared_ptr<Kqchan> kqchan);
 		void unregisterKqchan(std::shared_ptr<Kqchan> kqchan);

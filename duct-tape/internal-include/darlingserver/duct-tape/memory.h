@@ -14,6 +14,8 @@ typedef struct dtape_map_shared_descriptor {
 	os_refcnt_t refcount;
 	int memfd;
 	uint64_t size;
+	uint64_t file_device;
+	uint64_t file_inode;
 } dtape_map_shared_descriptor_t;
 
 typedef struct dtape_map_shared_entry {

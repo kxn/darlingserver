@@ -1,4 +1,5 @@
 #include <darlingserver/duct-tape/stubs.h>
+#include <darlingserver/duct-tape/processor.h>
 
 #include <kern/host.h>
 #include <mach_debug/mach_debug.h>
@@ -61,7 +62,7 @@ kern_return_t host_info(host_t host, host_flavor_t flavor, host_info_t info, mac
 #if __x86_64__ || __i386__
 			basic_info->cpu_type = CPU_TYPE_X86;
 #if __x86_64__
-			basic_info->cpu_subtype = CPU_SUBTYPE_X86_64_ALL;
+			basic_info->cpu_subtype = dtape_processor_cpu_subtype();
 #else
 			basic_info->cpu_subtype = CPU_SUBTYPE_I386_ALL;
 #endif
@@ -133,7 +134,7 @@ kern_return_t host_info(host_t host, host_flavor_t flavor, host_info_t info, mac
 #if __x86_64__ || __i386__
 			user_arch_info->cpu_type = CPU_TYPE_X86;
 #if __x86_64__
-			user_arch_info->cpu_subtype = CPU_SUBTYPE_X86_64_ALL;
+			user_arch_info->cpu_subtype = dtape_processor_cpu_subtype();
 #else
 			user_arch_info->cpu_subtype = CPU_SUBTYPE_I386_ALL;
 #endif
