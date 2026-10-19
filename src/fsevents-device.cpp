@@ -4,6 +4,7 @@
 // It refuses other event selections. inotify has no originating PID; records
 // explicitly use PID 0, and incomplete observations produce EVENTS_DROPPED.
 #include <darlingserver/fsevents-device.hpp>
+#include <darlingserver/fsevents-journal.hpp>
 
 #include <sys/inotify.h>
 #include <sys/socket.h>
@@ -76,6 +77,9 @@ struct Device : std::enable_shared_from_this<Device> {
     std::unordered_map<uint32_t,Pending> moves;
     std::deque<std::vector<uint8_t>> queue;
     bool lost=false;
+    std::vector<Root> journalRoots;
+    Journal* journal=nullptr;
+    uint64_t subscription=0;
     ~Device() {
         if (notify>=0) close(notify);
         if (peer>=0) close(peer);
@@ -319,4 +323,55 @@ int setExtended(int fd) {
 }
 bool isDevice(int fd) { return bool(find(fd)); }
 size_t activeDevices() { std::lock_guard lock(registry().mutex);return registry().devices.size(); }
+namespace {
+Journal& sharedJournal(const std::string& prefix) {
+    // Survives detached descriptor-lifetime workers until process teardown.
+    static auto* mutex=new std::mutex;
+    static auto* instances=new std::unordered_map<std::string,std::unique_ptr<Journal>>;
+    std::lock_guard lock(*mutex);
+    auto& value=(*instances)[prefix];
+    if(!value)value=std::make_unique<Journal>(prefix+"/.darling-fsevents-id",std::vector<Root>{{prefix,"/"}});
+    return *value;
+}
+}
+int journalCurrent(int fd,const std::string& prefix,uint64_t& value) {
+    if(!find(fd))return -ENOTTY;
+    return sharedJournal(prefix).current(value);
+}
+int journalAddRoot(int fd,const std::string& host,const std::string& guest) {
+    auto device=find(fd);if(!device)return -ENOTTY;
+    std::lock_guard lock(device->mutex);
+    if(device->notify>=0||device->journal)return -EBUSY;
+    if(device->journalRoots.size()>=256)return -E2BIG;
+    device->journalRoots.push_back({host,guest});return 0;
+}
+int journalBegin(int fd,const std::string& prefix,uint64_t since,uint32_t flags) {
+    auto device=find(fd);if(!device)return -ENOTTY;
+    std::lock_guard lock(device->mutex);
+    if(device->notify>=0||device->journal)return -EBUSY;
+    std::weak_ptr<Device> weak=device;
+    auto& journal=sharedJournal(prefix);
+    uint64_t handle=0;
+    int result=journal.subscribe(device->journalRoots,since,flags,[weak](const JournalEvent& event){
+        auto owner=weak.lock();if(!owner)return -1;
+        struct Header {uint32_t magic,length;uint64_t id;uint32_t flags,reserved;};
+        static_assert(sizeof(Header)==24);
+        if(event.path.size()>16383)return -1;
+        Header header{0x314a5346,uint32_t(event.path.empty()?0:event.path.size()+1),event.id,event.flags,0};
+        std::vector<uint8_t> packet(sizeof header+header.length);
+        memcpy(packet.data(),&header,sizeof header);
+        if(header.length)memcpy(packet.data()+sizeof header,event.path.c_str(),header.length);
+        auto n=send(owner->peer,packet.data(),packet.size(),MSG_DONTWAIT|MSG_NOSIGNAL);
+        if(n==ssize_t(packet.size()))return 1;
+        return n<0&&(errno==EAGAIN||errno==EWOULDBLOCK)?0:-1;
+    },handle,[weak]{return !weak.expired();});
+    if(result<0)return result;
+    device->journal=&journal;device->subscription=handle;return 0;
+}
+int journalBarrier(int fd,uint64_t& ticket) {
+    auto device=find(fd);if(!device)return -ENOTTY;
+    Journal* journal;uint64_t handle;
+    {std::lock_guard lock(device->mutex);journal=device->journal;handle=device->subscription;}
+    return journal?journal->barrier(handle,ticket):-ENOTTY;
+}
 }

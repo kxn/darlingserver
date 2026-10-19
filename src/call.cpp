@@ -1056,7 +1056,40 @@ void DarlingServer::Call::FseventsIoctl::processCall() {
                 }
                 case 0x20007365: result=FSEvents::setCompact(_body.fd);break;
                 case 0x20007366: result=FSEvents::setExtended(_body.fd);break;
-                case 0x40087367: result=-ENOTSUP;break; // persistent event IDs not provided by inotify
+                case 0x40087367: { // shared observed-event high-water mark
+                    uint64_t value=0;
+                    result=FSEvents::journalCurrent(_body.fd,Server::sharedInstance().prefix(),value);
+                    if(!result&&!process->writeMemory(_body.argument,&value,sizeof value))result=-EFAULT;
+                    break;
+                }
+                case 0x80107370: { // root opened through the client's actual vchroot
+                    struct Root {uint64_t path;uint32_t length;int32_t descriptor;} args{};
+                    if(!process->readMemory(_body.argument,&args,sizeof args)){result=-EFAULT;break;}
+                    if(args.length<2||args.length>16384||args.descriptor<0){result=-EINVAL;break;}
+                    std::string guest(args.length,'\0');
+                    if(!process->readMemory(args.path,guest.data(),guest.size())){result=-EFAULT;break;}
+                    if(guest.front()!='/'||guest.back()!='\0'||guest.find('\0')!=guest.size()-1){result=-EINVAL;break;}
+                    guest.pop_back();
+                    auto link="/proc/"+std::to_string(process->id())+"/fd/"+std::to_string(args.descriptor);
+                    int directory=open(link.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+                    if(directory<0){result=-errno;break;}
+                    std::vector<char> host(16384);auto name="/proc/self/fd/"+std::to_string(directory);
+                    auto length=readlink(name.c_str(),host.data(),host.size()-1);int saved=errno;close(directory);
+                    if(length<0){result=-saved;break;}
+                    host[length]=0;
+                    result=FSEvents::journalAddRoot(_body.fd,host.data(),guest);break;
+                }
+                case 0x80107371: {
+                    struct Start {uint64_t since;uint32_t flags,reserved;} args{};
+                    if(!process->readMemory(_body.argument,&args,sizeof args)){result=-EFAULT;break;}
+                    if(args.reserved){result=-EINVAL;break;}
+                    result=FSEvents::journalBegin(_body.fd,Server::sharedInstance().prefix(),args.since,args.flags);break;
+                }
+                case 0x40087372: {
+                    uint64_t ticket=0;result=FSEvents::journalBarrier(_body.fd,ticket);
+                    if(!result&&!process->writeMemory(_body.argument,&ticket,sizeof ticket))result=-EFAULT;
+                    break;
+                }
                 default: result=-ENOTTY;break;
             }
         } catch (const std::bad_alloc&) { result=-ENOMEM; }

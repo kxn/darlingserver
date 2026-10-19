@@ -112,6 +112,7 @@ add_executable(darlingserver
 	src/call.cpp
 	src/sandbox-policy.cpp
 	src/fsevents-device.cpp
+	src/fsevents-journal.cpp
 	src/registry.cpp
 	src/logging.cpp
 	src/process.cpp

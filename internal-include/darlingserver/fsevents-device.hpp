@@ -17,5 +17,9 @@ int setCompact(int stream);
 int setExtended(int stream);
 bool isDevice(int fd);
 size_t activeDevices();
+int journalCurrent(int fd,const std::string& prefix,uint64_t& value);
+int journalAddRoot(int fd,const std::string& host,const std::string& guest);
+int journalBegin(int fd,const std::string& prefix,uint64_t since,uint32_t flags);
+int journalBarrier(int fd,uint64_t& ticket);
 }
 #endif
