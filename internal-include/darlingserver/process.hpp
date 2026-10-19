@@ -213,6 +213,7 @@ namespace DarlingServer {
 
 		MemoryInfo memoryInfo() const;
 		MemoryRegionInfo memoryRegionInfo(uintptr_t address) const;
+		std::vector<MemoryRegionInfo> memoryRegions() const;
 
 		std::shared_ptr<Process> tracerProcess() const;
 		bool setTracerProcess(std::shared_ptr<Process> tracerProcess);

@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <sys/uio.h>
 #include <darlingserver/logging.hpp>
+#include <darlingserver/proc-maps.hpp>
 
 #include <fstream>
 #include <regex>
@@ -512,61 +513,40 @@ DarlingServer::Process::MemoryInfo DarlingServer::Process::memoryInfo() const {
 	return info;
 };
 
-static const std::regex memoryRegionEntryRegex("([0-9a-fA-F]+)\\-([0-9a-fA-F]+)\\s+((?:r|w|x|p|s|\\-)+)\\s+([0-9a-fA-F]+)\\s+([0-9a-fA-F]+):([0-9a-fA-F]+)\\s+([0-9]+)");
+std::vector<DarlingServer::Process::MemoryRegionInfo> DarlingServer::Process::memoryRegions() const {
+	if (isDead()) throw std::system_error(ESRCH, std::generic_category(), "dead process; can't read maps");
+	std::ifstream file("/proc/" + std::to_string(_pid) + "/maps");
+	if (!file) throw std::system_error(EIO, std::generic_category(), "cannot open process maps");
+	std::vector<MemoryRegionInfo> regions;
+	std::string line;
+	uint64_t previousEnd = 0;
+	uint64_t pageSize = sysconf(_SC_PAGESIZE);
+	while (std::getline(file, line)) {
+		ProcMaps::Entry entry;
+		if (!ProcMaps::parse(line, entry) || entry.start < previousEnd
+				|| entry.start % pageSize || entry.end % pageSize)
+			throw std::system_error(EIO, std::generic_category(), "malformed process maps entry");
+		MemoryRegionInfo info;
+		info.startAddress = entry.start;
+		info.pageCount = (entry.end - entry.start) / pageSize;
+		info.mapOffset = entry.offset;
+		info.fileDevice = entry.device;
+		info.fileInode = entry.inode;
+		info.protection = entry.protection;
+		info.shared = entry.shared;
+		regions.push_back(info);
+		previousEnd = entry.end;
+	}
+	if (file.bad()) throw std::system_error(EIO, std::generic_category(), "cannot read process maps");
+	return regions;
+};
 
 DarlingServer::Process::MemoryRegionInfo DarlingServer::Process::memoryRegionInfo(uintptr_t address) const {
-	if (isDead()) {
-		throw std::system_error(ESRCH, std::generic_category(), "dead process; can't call memoryRegionInfo");
+	for (const auto& info : memoryRegions()) {
+		if (info.startAddress > address) break;
+		if (address - info.startAddress < info.pageCount * sysconf(_SC_PAGESIZE)) return info;
 	}
-
-	MemoryRegionInfo info;
-	std::ifstream file("/proc/" + std::to_string(_pid) + "/maps");
-	std::string line;
-
-	uintptr_t endAddress;
-
-	while (std::getline(file, line)) {
-		std::smatch match;
-
-		if (!std::regex_search(line, match, memoryRegionEntryRegex)) {
-			processLog.warning() << "Encountered malformed `/proc/<pid>/maps` entry? Definitely a bug (on our part)." << processLog.endLog;
-			continue;
-		}
-
-		info.startAddress = std::stoul(match[1].str(), nullptr, 16);
-		endAddress = std::stoul(match[2].str(), nullptr, 16);
-
-		if (endAddress <= address || info.startAddress > address) {
-			continue;
-		}
-
-		info.pageCount = (endAddress - info.startAddress) / sysconf(_SC_PAGESIZE);
-
-		info.mapOffset = std::stoul(match[4].str(), nullptr, 16);
-		info.fileDevice = makedev(std::stoul(match[5].str(), nullptr, 16), std::stoul(match[6].str(), nullptr, 16));
-		info.fileInode = std::stoull(match[7].str());
-
-		auto perms = match[3].str();
-
-		info.protection = 0;
-
-		if (perms.find('r') != std::string::npos) {
-			info.protection |= PROT_READ;
-		}
-		if (perms.find('w') != std::string::npos) {
-			info.protection |= PROT_WRITE;
-		}
-		if (perms.find('x') != std::string::npos) {
-			info.protection |= PROT_EXEC;
-		}
-
-		info.shared = perms.find('s') != std::string::npos;
-
-		return info;
-	}
-
-	processLog.warning() << *this << ": Address 0x" << std::hex << address << " not found in \"/proc/" << std::dec << _pid << "/maps\"" << processLog.endLog;
-	throw std::system_error(EFAULT, std::generic_category());
+	throw std::system_error(EFAULT, std::generic_category(), "address not mapped");
 };
 
 #if DSERVER_EXTENDED_DEBUG
@@ -710,36 +690,10 @@ void DarlingServer::Process::syncMemory(uintptr_t address, size_t size, int sync
 	return thread->syncMemory(address, size, sync_flags);
 };
 
-static const std::regex memoryRegionEntryAddressRegex("([0-9a-fA-F]+)\\-([0-9a-fA-F]+)");
-
 uintptr_t DarlingServer::Process::getNextRegion(uintptr_t address) const {
-	if (isDead()) {
-		throw std::system_error(ESRCH, std::generic_category(), "dead process; can't call getNextRegion");
+	for (const auto& info : memoryRegions()) {
+		if (info.startAddress > address) return info.startAddress;
 	}
-
-	std::ifstream file("/proc/" + std::to_string(_pid) + "/maps");
-	std::string line;
-
-	while (std::getline(file, line)) {
-		std::smatch match;
-
-		if (!std::regex_search(line, match, memoryRegionEntryAddressRegex)) {
-			processLog.warning() << "Encountered malformed `/proc/<pid>/maps` entry? Definitely a bug (on our part)." << processLog.endLog;
-			continue;
-		}
-
-		auto startAddress = std::stoul(match[1].str(), nullptr, 16);
-		auto endAddress = std::stoul(match[2].str(), nullptr, 16);
-
-		if (startAddress <= address) {
-			continue;
-		}
-
-		// /proc/<pid>/maps is sorted in ascending order, so as soon as we find a line with a starting address greater than `address`, that's the next region
-
-		return startAddress;
-	}
-
 	return 0;
 };
 

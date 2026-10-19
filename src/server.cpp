@@ -18,6 +18,7 @@
  */
 
 #include <cstdint>
+#include <cstdlib>
 #include <darlingserver/server.hpp>
 #include <sys/socket.h>
 #include <stdexcept>
@@ -307,6 +308,32 @@ struct DTapeHooks {
 		return true;
 	};
 
+	static bool dtape_hook_task_copy_memory_regions(void* task_context, dtape_memory_region_info_t** output, size_t* count) {
+		static_assert(dtape_memory_protection_read == PROT_READ && dtape_memory_protection_write == PROT_WRITE && dtape_memory_protection_execute == PROT_EXEC,
+			"snapshot protection bits must match Linux mmap protection bits");
+		*output = nullptr;
+		*count = 0;
+		try {
+			auto regions = static_cast<DarlingServer::Process*>(task_context)->memoryRegions();
+			auto result = static_cast<dtape_memory_region_info_t*>(calloc(regions.size(), sizeof(dtape_memory_region_info_t)));
+			if (!result && !regions.empty()) return false;
+			for (size_t i = 0; i < regions.size(); ++i) {
+				result[i].start_address = regions[i].startAddress;
+				result[i].page_count = regions[i].pageCount;
+				result[i].map_offset = regions[i].mapOffset;
+				result[i].file_device = regions[i].fileDevice;
+				result[i].file_inode = regions[i].fileInode;
+				result[i].shared = regions[i].shared;
+				result[i].protection = static_cast<dtape_memory_protection_t>(regions[i].protection);
+			}
+			*output = result;
+			*count = regions.size();
+			return true;
+		} catch (const std::exception&) {
+			return false;
+		}
+	};
+
 	static bool dtape_hook_file_identity(int fd, uint64_t* device, uint64_t* inode) {
 		struct stat info;
 		if (fstat(fd, &info) < 0) return false;
@@ -446,6 +473,7 @@ struct DTapeHooks {
 		.task_remove_port_set_member = dtape_hook_task_remove_port_set_member,
 		.task_clear_port_set = dtape_hook_task_clear_port_set,
 #endif
+		.task_copy_memory_regions = dtape_hook_task_copy_memory_regions,
 	};
 };
 

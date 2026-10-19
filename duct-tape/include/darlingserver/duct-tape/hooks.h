@@ -55,6 +55,8 @@ typedef dtape_task_t* (*dtape_hook_task_lookup_f)(int id, bool id_is_nsid, bool 
 typedef dtape_task_t* (*dtape_hook_task_lookup_eternal_f)(dtape_eternal_id_t eid, bool retain);
 typedef void (*dtape_hook_task_get_memory_info_f)(void* task_context, dtape_memory_info_t* memory_info);
 typedef bool (*dtape_hook_task_get_memory_region_info_f)(void* task_context, uintptr_t address, dtape_memory_region_info_t* memory_region_info);
+/* Returns a malloc-owned, address-ordered snapshot for one reconciliation. */
+typedef bool (*dtape_hook_task_copy_memory_regions_f)(void* task_context, dtape_memory_region_info_t** regions, size_t* count);
 typedef bool (*dtape_hook_file_identity_f)(int fd, uint64_t* device, uint64_t* inode);
 typedef uintptr_t (*dtape_hook_task_allocate_pages_f)(void* task_context, size_t page_count, int protection, uintptr_t address_hint, dtape_memory_flags_t flags);
 typedef int (*dtape_hook_task_free_pages_f)(void* task_context, uintptr_t address, size_t page_count);
@@ -124,6 +126,7 @@ typedef struct dtape_hooks {
 	dtape_hook_task_remove_port_set_member_f task_remove_port_set_member;
 	dtape_hook_task_clear_port_set_f task_clear_port_set;
 #endif
+	dtape_hook_task_copy_memory_regions_f task_copy_memory_regions;
 } dtape_hooks_t;
 
 #ifdef __cplusplus
