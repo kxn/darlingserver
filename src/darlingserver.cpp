@@ -701,7 +701,15 @@ int main(int argc, char** argv) {
 
 		close(childWaitFDs[1]);
 
-		snprintf(putOld, sizeof(putOld), "%s/proc", prefix);
+		snprintf(putOld, sizeof(putOld), "%s%s", prefix, DARLING_PROCFS_PATH);
+        // The mount is for Darwin compatibility internals. Exposing Linux's
+        // conventional /proc makes macOS tools detect a Linux host.
+        std::error_code procDirectoryError;
+        std::filesystem::create_directories(putOld, procDirectoryError);
+        if (procDirectoryError) {
+            fprintf(stderr, "Cannot create internal procfs mount point: %s\n", procDirectoryError.message().c_str());
+            exit(1);
+        }
 
 		// mount procfs for our new PID namespace
 		if (mount("proc", putOld, "proc", 0, "") != 0)
