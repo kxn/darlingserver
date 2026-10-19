@@ -543,11 +543,42 @@ bool task_is_driver(task_t task) {
 };
 
 kern_return_t task_map_corpse_info(task_t task, task_t corpse_task, vm_address_t* kcd_addr_begin, uint32_t* kcd_size) {
-	dtape_stub_unsafe();
+	mach_vm_address_t address = 0;
+	mach_vm_size_t size = 0;
+	if (!kcd_addr_begin || !kcd_size) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	*kcd_addr_begin = 0;
+	*kcd_size = 0;
+	kern_return_t result = task_map_corpse_info_64(task, corpse_task, &address, &size);
+	if (result != KERN_SUCCESS) {
+		return result;
+	}
+	if (size > UINT32_MAX) {
+		return KERN_NOT_SUPPORTED;
+	}
+	*kcd_addr_begin = address;
+	*kcd_size = (uint32_t)size;
+	return KERN_SUCCESS;
 };
 
 kern_return_t task_map_corpse_info_64(task_t task, task_t corpse_task, mach_vm_address_t* kcd_addr_begin, mach_vm_size_t* kcd_size) {
-	dtape_stub_unsafe();
+	if (!kcd_addr_begin || !kcd_size) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	*kcd_addr_begin = 0;
+	*kcd_size = 0;
+	// Match XNU's rejection of a null/forked-corpse destination and of a
+	// source which is not a corpse or has no crash data. Normal task ports
+	// must return an error, not take an unreachable path in the whole server.
+	if (task == TASK_NULL || task_is_a_corpse_fork(task) ||
+	    corpse_task == TASK_NULL || !task_is_a_corpse(corpse_task) ||
+	    corpse_task->corpse_info == NULL) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	// Darling does not yet produce/map XNU corpse kcdata. Preserve an honest
+	// unsupported result for that path; do not fabricate a crash-data mapping.
+	return KERN_NOT_SUPPORTED;
 };
 
 void task_name_deallocate(task_name_t task_name) {
