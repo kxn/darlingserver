@@ -549,6 +549,18 @@ wait_result_t thread_block(thread_continue_t continuation) {
 boolean_t thread_unblock(thread_t xthread, wait_result_t wresult) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
 	thread->xnu_thread.wait_result = wresult;
+
+	// Match XNU sched_prim.c thread_unblock(): a wait which completed early
+	// must not leave a timer that can expire a subsequent, unrelated wait.
+	// The caller holds the thread lock. An already-running callback retains
+	// its active reference and observes wait_timer_is_set after taking it.
+	if (xthread->wait_timer_is_set) {
+		if (timer_call_cancel(&xthread->wait_timer)) {
+			xthread->wait_timer_active--;
+		}
+		xthread->wait_timer_is_set = FALSE;
+	}
+
 	dtape_hooks->thread_resume(thread->context);
 	return TRUE;
 };
