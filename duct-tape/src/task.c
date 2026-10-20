@@ -44,6 +44,13 @@ void dtape_task_init(void) {
 	}
 };
 
+void dtape_task_set_audit_identity(dtape_task_t* task, uint32_t auid, uint32_t asid) {
+    task_lock(&task->xnu_task);
+    task->xnu_task.audit_token.val[0] = auid;
+    task->xnu_task.audit_token.val[6] = asid;
+    task_unlock(&task->xnu_task);
+}
+
 void dtape_task_set_process_generation(dtape_task_t* task, dtape_eternal_id_t identity, uint32_t pid_version) {
 	task_lock(&task->xnu_task);
 	task->p_ident.eid = identity;

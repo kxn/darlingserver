@@ -29,6 +29,7 @@
 #include <unordered_set>
 
 #include <darlingserver/duct-tape.h>
+#include <darlingserver/audit-session.hpp>
 #include <darlingserver/utility.hpp>
 #include <darlingserver/kqchan.hpp>
 #include <darlingserver/rpc.h>
@@ -107,6 +108,8 @@ namespace DarlingServer {
 			uint32_t flags;
 		};
 		std::shared_ptr<const QuarantineState> _quarantineState;
+		std::shared_ptr<const AuditSession> _auditSession;
+		uint32_t _auditMaskSuccess = 0, _auditMaskFailure = 0;
 		uint32_t _quarantineKernelCapabilities = 0;
 		SandboxState _sandboxState = SandboxState::Unconfined;
 		std::shared_ptr<const Sandbox::Policy> _sandboxPolicy;

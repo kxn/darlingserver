@@ -673,6 +673,9 @@ calls = [
 	], [('fd', '@fd')]),
 ]
 
+# Append-only private transport for actual per-process audit state.
+calls.append(('audit_info', [('operation', 'uint32_t'), ('buffer', 'void*', 'uint64_t'), ('length', 'uint32_t')], []))
+
 ALLOWED_PRIVATE_TYPES = [
 	'bool',
 	'int8_t',

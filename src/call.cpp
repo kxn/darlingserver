@@ -22,6 +22,8 @@
 #include <darlingserver/server.hpp>
 #include <sys/uio.h>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 
 #include <darlingserver/logging.hpp>
 #include <darlingserver/duct-tape.h>
@@ -1515,3 +1517,59 @@ void DarlingServer::Call::DebugListMessages::processCall() {
 };
 
 DSERVER_CLASS_SOURCE_DEFS;
+
+void DarlingServer::Call::AuditInfo::processCall() {
+    int code=-ESRCH;
+    auto thread=_thread.lock();
+    auto process=thread ? thread->process() : nullptr;
+    if (process) {
+        // The kernel client cannot nominate credentials through this RPC.
+        // Read the current effective UID from the authenticated process PID.
+        std::ifstream status("/proc/"+std::to_string(process->_pid)+"/status");
+        std::string line; uint32_t ruid=UINT32_MAX,euid=UINT32_MAX;
+        while (std::getline(status,line)) {
+            if (line.compare(0,4,"Uid:")==0) {
+                std::istringstream fields(line.substr(4)); fields>>ruid>>euid; break;
+            }
+        }
+        if (euid!=UINT32_MAX) {
+            darling_audit_info_t info{};
+            size_t count=std::min<size_t>(_body.length,sizeof(info));
+            if (_body.operation==0) {
+                {
+                    std::shared_lock lock(process->_rwlock);
+                    info=process->_auditSession->info;
+                    info.mask_success=euid ? UINT32_MAX : process->_auditMaskSuccess;
+                    info.mask_failure=euid ? UINT32_MAX : process->_auditMaskFailure;
+                }
+                code=(!count || process->writeMemory(_body.buffer,&info,count)) ? 0 : -EFAULT;
+            } else if (_body.operation==1) {
+                if (count && !process->readMemory(_body.buffer,&info,count)) code=-EFAULT;
+                else if (euid) code=-EPERM;
+                else if (info.terminal_type!=4 && info.terminal_type!=16) code=-EINVAL;
+                // Only a headless session is supported. Do not advertise UI,
+                // TTY or remote-login attributes that this backend can't grant.
+                else if (info.flags) code=-EINVAL;
+                else {
+                    std::unique_lock lock(process->_rwlock);
+                    auto old=process->_auditSession;
+                    if (info.asid==0 || info.asid==UINT32_MAX) {
+                        try { process->_auditSession=AuditSession::create(info); code=0; }
+                        catch (const std::system_error& e) { code=-e.code().value(); }
+                    } else if (info.asid!=old->info.asid) code=-ENOTSUP;
+                    else if (info.auid!=old->info.auid || info.flags!=old->info.flags ||
+                             info.terminal_type!=old->info.terminal_type ||
+                             info.terminal_port!=old->info.terminal_port ||
+                             memcmp(info.terminal_address,old->info.terminal_address,sizeof(info.terminal_address))) code=-EINVAL;
+                    else code=0;
+                    if (!code) {
+                        process->_auditMaskSuccess=info.mask_success;
+                        process->_auditMaskFailure=info.mask_failure;
+                        dtape_task_set_audit_identity(process->_dtapeTask,process->_auditSession->info.auid,process->_auditSession->info.asid);
+                    }
+                }
+            } else code=-EINVAL;
+        }
+    }
+    _sendReply(code);
+}

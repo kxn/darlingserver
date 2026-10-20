@@ -109,12 +109,36 @@ DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int
 		_sandboxState = parentProcess->_sandboxState;
 		_sandboxPolicy = parentProcess->_sandboxPolicy;
 		_quarantineState = parentProcess->_quarantineState;
+		_auditSession = parentProcess->_auditSession;
+		_auditMaskSuccess = parentProcess->_auditMaskSuccess;
+		_auditMaskFailure = parentProcess->_auditMaskFailure;
 		_quarantineKernelCapabilities = parentProcess->_quarantineKernelCapabilities;
 	}
+
+    if (!_auditSession) {
+        // Establish a headless bootstrap session for a process with no parent
+        // managed by this server. Credentials come from its actual Linux proc
+        // record; no graphics/TTY capability is claimed.
+        std::ifstream credentials("/proc/" + std::to_string(_pid) + "/status");
+        uint32_t uid=UINT32_MAX;
+        while (std::getline(credentials,line)) {
+            if (line.compare(0,4,"Uid:")==0) {
+                std::istringstream fields(line.substr(4));
+                if (!(fields>>uid)) throw std::system_error(ESRCH,std::generic_category());
+                break;
+            }
+        }
+        if (uid==UINT32_MAX) throw std::system_error(ESRCH,std::generic_category());
+        darling_audit_info_t info{};
+        info.auid=uid;
+        info.terminal_type=4; // AU_IPv4, default terminal identity
+        _auditSession=AuditSession::create(info);
+    }
 
 	// NOTE: see thread.cpp for why it's okay to use `this` here
 	_dtapeTask = dtape_task_create(parentProcess ? parentProcess->_dtapeTask : nullptr, _nspid, this, static_cast<dserver_rpc_architecture_t>(_architecture));
 	_dtapeForkWaitSemaphore = dtape_semaphore_create(_dtapeTask, 0);
+    dtape_task_set_audit_identity(_dtapeTask, _auditSession->info.auid, _auditSession->info.asid);
 
 	processLog.info() << "New process created with ID " << _pid << " and NSID " << _nspid;
 };
