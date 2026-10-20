@@ -509,9 +509,10 @@ mach_msg_receive_continue(void)
  *		All of mach_msg_send and mach_msg_receive error codes.
  */
 
-mach_msg_return_t
-mach_msg_overwrite_trap(
-	struct mach_msg_overwrite_trap_args *args)
+static mach_msg_return_t
+mach_msg_overwrite_with_header(
+	struct mach_msg_overwrite_trap_args *args,
+	const darling_mach_msg_capture_t *captured)
 {
 	mach_vm_address_t       msg_addr = args->msg;
 	mach_msg_option_t       option = args->option;
@@ -535,7 +536,7 @@ mach_msg_overwrite_trap(
 
 		KDBG(MACHDBG_CODE(DBG_MACH_IPC, MACH_IPC_KMSG_INFO) | DBG_FUNC_START);
 
-		mr = ipc_kmsg_get(msg_addr, send_size, &kmsg);
+		mr = ipc_kmsg_get_with_header(msg_addr, send_size, captured, &kmsg);
 
 		if (mr != MACH_MSG_SUCCESS) {
 			KDBG(MACHDBG_CODE(DBG_MACH_IPC, MACH_IPC_KMSG_INFO) | DBG_FUNC_END, mr);
@@ -615,6 +616,75 @@ end:
 	ipc_port_thread_group_unblocked();
 	return mr;
 }
+
+mach_msg_return_t
+mach_msg_overwrite_trap(struct mach_msg_overwrite_trap_args *args)
+{
+	return mach_msg_overwrite_with_header(args, NULL);
+}
+
+#ifdef DARLING
+#define DARLING_MACH64_VECTOR       (1ull << 32)
+#define DARLING_MACH64_KOBJECT      (1ull << 33)
+#define DARLING_MACH64_MQUEUE       (1ull << 34)
+#define DARLING_MACH64_ANY          (1ull << 35)
+#define DARLING_MACH_SEND_INVALID_OPTIONS 0x10000013
+
+mach_msg_return_t
+mach_msg2_trap(struct mach_msg2_trap_args *args)
+{
+	const uint64_t selectors = DARLING_MACH64_KOBJECT |
+	    DARLING_MACH64_MQUEUE | DARLING_MACH64_ANY;
+	const uint64_t supported = (uint32_t)MACH_MSG_OPTION_USER | selectors;
+	uint64_t options = args->options;
+	uint64_t selected = options & selectors;
+	/* Vector/auxiliary messages and new lower option bits require separate
+	 * backend support. Reject them explicitly without consuming a message. */
+	if ((options & ~supported) ||
+	    ((options & MACH_SEND_MSG) && (!selected || (selected & (selected - 1))))) {
+		return DARLING_MACH_SEND_INVALID_OPTIONS;
+	}
+	darling_mach_msg_capture_t captured = {0};
+	captured.header.msgh_bits = (uint32_t)args->msgh_bits_and_send_size;
+	captured.header.msgh_remote_port = (uint32_t)args->msgh_remote_and_local_port;
+	captured.header.msgh_local_port = (uint32_t)(args->msgh_remote_and_local_port >> 32);
+	captured.header.msgh_voucher_port = (uint32_t)args->msgh_voucher_and_id;
+	captured.header.msgh_id = (uint32_t)(args->msgh_voucher_and_id >> 32);
+	captured.body.msgh_descriptor_count = (uint32_t)args->desc_count_and_rcv_name;
+
+	/* Verify destination kind before consuming send/receive rights. Failure
+	 * to translate a right is left to normal IPC validation and its errors. */
+	if ((options & MACH_SEND_MSG) && selected != DARLING_MACH64_ANY) {
+		ipc_port_t port = IP_NULL;
+		kern_return_t kr = ipc_port_translate_send(current_space(),
+		    captured.header.msgh_remote_port, &port);
+		if (kr != KERN_SUCCESS &&
+		    MACH_MSGH_BITS_REMOTE(captured.header.msgh_bits) == MACH_MSG_TYPE_MAKE_SEND) {
+			kr = ipc_port_translate_receive(current_space(),
+			    captured.header.msgh_remote_port, &port);
+		}
+		if (kr == KERN_SUCCESS) {
+			boolean_t object = ip_is_kobject(port);
+			ip_unlock(port);
+			if ((selected == DARLING_MACH64_KOBJECT) != (object != FALSE)) {
+				return DARLING_MACH_SEND_INVALID_OPTIONS;
+			}
+		}
+	}
+	struct mach_msg_overwrite_trap_args old = {
+		.msg = args->data, .option = (uint32_t)options,
+		.send_size = (uint32_t)(args->msgh_bits_and_send_size >> 32),
+		.rcv_size = (uint32_t)args->rcv_size_and_priority,
+		.rcv_name = (uint32_t)(args->desc_count_and_rcv_name >> 32),
+		.timeout = (uint32_t)args->timeout,
+		.priority = (uint32_t)(args->rcv_size_and_priority >> 32),
+	};
+	if ((options & MACH_RCV_SYNC_WAIT) && !(options & MACH_SEND_MSG)) {
+		old.priority = captured.header.msgh_remote_port;
+	}
+	return mach_msg_overwrite_with_header(&old, &captured);
+}
+#endif
 
 /*
  *	Routine:	mach_msg_rcv_link_special_reply_port

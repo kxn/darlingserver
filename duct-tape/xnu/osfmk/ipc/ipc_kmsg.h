@@ -273,6 +273,22 @@ extern mach_msg_return_t ipc_kmsg_get(
 	mach_msg_size_t         size,
 	ipc_kmsg_t              *kmsgp);
 
+#ifdef DARLING
+/* Captured register header is authoritative; user header may be read-only. */
+typedef struct {
+    struct {
+        mach_msg_bits_t msgh_bits;
+        mach_msg_size_t msgh_size;
+        mach_port_name_t msgh_remote_port, msgh_local_port, msgh_voucher_port;
+        mach_msg_id_t msgh_id;
+    } header;
+    mach_msg_body_t body;
+} darling_mach_msg_capture_t;
+extern mach_msg_return_t ipc_kmsg_get_with_header(
+	mach_vm_address_t msg_addr, mach_msg_size_t size,
+	const darling_mach_msg_capture_t *captured, ipc_kmsg_t *kmsgp);
+#endif
+
 /* Allocate a kernel message buffer and copy a kernel message to the buffer */
 extern mach_msg_return_t ipc_kmsg_get_from_kernel(
 	mach_msg_header_t       *msg,

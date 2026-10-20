@@ -676,6 +676,15 @@ calls = [
 # Append-only private transport for actual per-process audit state.
 calls.append(('audit_info', [('operation', 'uint32_t'), ('buffer', 'void*', 'uint64_t'), ('length', 'uint32_t')], []))
 
+calls.append(('mach_msg2', [
+	('data', 'uint64_t'), ('options', 'uint64_t'),
+	('msgh_bits_and_send_size', 'uint64_t'),
+	('msgh_remote_and_local_port', 'uint64_t'),
+	('msgh_voucher_and_id', 'uint64_t'),
+	('desc_count_and_rcv_name', 'uint64_t'),
+	('rcv_size_and_priority', 'uint64_t'), ('timeout', 'uint64_t'),
+], [], XNU_TRAP_CALL | XNU_TRAP_NOPREFIX | ALLOW_INTERRUPTIONS))
+
 ALLOWED_PRIVATE_TYPES = [
 	'bool',
 	'int8_t',

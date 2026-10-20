@@ -1938,9 +1938,10 @@ ipc_kmsg_prealloc(mach_msg_size_t size)
  */
 
 mach_msg_return_t
-ipc_kmsg_get(
+ipc_kmsg_get_with_header(
 	mach_vm_address_t       msg_addr,
 	mach_msg_size_t size,
+	const darling_mach_msg_capture_t *captured,
 	ipc_kmsg_t              *kmsgp)
 {
 	mach_msg_size_t                 msg_and_trailer_size;
@@ -1964,7 +1965,10 @@ ipc_kmsg_get(
 		len_copied = sizeof(mach_msg_legacy_base_t);
 	}
 
-	if (copyinmsg(msg_addr, (char *)&legacy_base, len_copied)) {
+	if (captured != NULL) {
+		_Static_assert(sizeof(legacy_base) == sizeof(*captured), "captured x86_64 header ABI");
+		memcpy(&legacy_base, captured, sizeof(legacy_base));
+	} else if (copyinmsg(msg_addr, (char *)&legacy_base, len_copied)) {
 		return MACH_SEND_INVALID_DATA;
 	}
 
@@ -2033,6 +2037,10 @@ ipc_kmsg_get(
 		}
 	}
 	__unreachable_ok_pop
+	if (captured != NULL && (legacy_base.header.msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
+		((mach_msg_base_t *)kmsg->ikm_header)->body.msgh_descriptor_count =
+		    captured->body.msgh_descriptor_count;
+	}
 	DEBUG_IPC_KMSG_PRINT(kmsg, "ipc_kmsg_get()");
 
 	/*
@@ -2059,6 +2067,12 @@ ipc_kmsg_get(
 	trailer->msgh_labels.sender = 0;
 	*kmsgp = kmsg;
 	return MACH_MSG_SUCCESS;
+}
+
+mach_msg_return_t
+ipc_kmsg_get(mach_vm_address_t msg_addr, mach_msg_size_t size, ipc_kmsg_t *kmsgp)
+{
+	return ipc_kmsg_get_with_header(msg_addr, size, NULL, kmsgp);
 }
 
 /*

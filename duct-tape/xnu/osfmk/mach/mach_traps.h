@@ -449,6 +449,17 @@ extern mach_msg_return_t mach_msg_trap(
 extern mach_msg_return_t mach_msg_overwrite_trap(
 	struct mach_msg_overwrite_trap_args *args);
 
+#ifdef DARLING
+/* x86_64 mach_msg2 register ABI; see Apple XNU mach_msg2_trap. */
+struct mach_msg2_trap_args {
+	uint64_t data, options;
+	uint64_t msgh_bits_and_send_size, msgh_remote_and_local_port;
+	uint64_t msgh_voucher_and_id, desc_count_and_rcv_name;
+	uint64_t rcv_size_and_priority, timeout;
+};
+extern mach_msg_return_t mach_msg2_trap(struct mach_msg2_trap_args *args);
+#endif
+
 struct semaphore_signal_trap_args {
 	PAD_ARG_(mach_port_name_t, signal_name);
 };

@@ -1,0 +1,9 @@
+# Scalar mach_msg2 backend for x86_64 Darling
+
+Paired server/libsystem_kernel implementation of the eight-register-word mach_msg2_internal ABI. Source reference: Apple XNU f6217f891ac0bb64f3d375211650a4c1ff8ca1ea, libsyscall/mach/mach_msg.c and osfmk/ipc/mach_msg.c. Captured register header/count is authoritative; only body bytes are copied from user memory, allowing read-only send buffers and mismatched memory header. Existing mach_msg path uses the same message acquisition with no capture override.
+
+New RPC is appended as call 88; all 87 existing signatures/order preserved. Actual server IPC handles rights, descriptors, sending, receiving, timeouts and invalid pointers. Kobject/message-queue selector mismatches return invalid options. Userspace retry follows the Apple send/receive interruption logic; interruption retry has not yet been covered by native signals.
+
+115 positive native assertions pass: 16 real messages through new send and old receive, read-only data, register header differing from memory, port descriptor/count override, combined real host_info MIG kernel request/reply and comparison to old host_info, invalid options/pointers/sizes/destinations, receive timeout and new receive. Baseline missing returns 12; wrong count returns 15. Prior audit/session regression passes all 537 parent/child checks on the new pair. All 1,365 parent kernel exports retained, with only mach_msg2_internal added; private RPC helper is hidden.
+
+This first backend supports scalar messages only. Vector/auxiliary/DriverKit and unsupported lower option bits explicitly return MACH_SEND_INVALID_OPTIONS before consuming rights. Modern hardened policy and guard-exception delivery are not fully ported; error return tests do not establish those semantics. It is not full contemporary mach_msg2 compatibility, resource compilation, or a finished Unity/UE App.
