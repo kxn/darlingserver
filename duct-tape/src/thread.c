@@ -7,6 +7,7 @@
 #include <darlingserver/duct-tape/psynch.h>
 
 #include <kern/thread.h>
+#include <bank/bank_internal.h>
 #include <kern/ipc_tt.h>
 #include <kern/policy_internal.h>
 #include <mach/thread_act.h>
@@ -67,6 +68,9 @@ dtape_thread_t* dtape_thread_create(dtape_task_t* task, uint64_t nsid, void* con
 	thread->xnu_thread.wait_result = THREAD_WAITING;
 	thread->xnu_thread.options = THREAD_ABORTSAFE;
 	thread->xnu_thread.state = TH_RUN;
+	/* User threads are registered after their Linux task is already running.
+	 * Kernel microthreads retain the existing deferred-start path. */
+	thread->xnu_thread.started = (&task->xnu_task != kernel_task);
 
 	os_ref_init_count(&thread->xnu_thread.ref_count, NULL, 1);
 
@@ -1327,9 +1331,53 @@ kern_return_t thread_policy_set(thread_t thread, thread_policy_flavor_t flavor, 
 	return KERN_SUCCESS;
 };
 
-kern_return_t thread_set_mach_voucher(thread_t thread, ipc_voucher_t voucher) {
-	dtape_stub_unsafe();
-};
+/* Adapted from the paired XNU kern/thread.c; retain real voucher refs and Bank ledger swaps. */
+kern_return_t
+thread_set_mach_voucher(
+	thread_t                thread,
+	ipc_voucher_t           voucher)
+{
+	ipc_voucher_t old_voucher;
+	ledger_t bankledger = NULL;
+	struct thread_group *banktg = NULL;
+	uint32_t persona_id = 0;
+
+	if (THREAD_NULL == thread) {
+		return KERN_INVALID_ARGUMENT;
+	}
+
+	bank_get_bank_ledger_thread_group_and_persona(voucher, &bankledger, &banktg, &persona_id);
+
+	thread_mtx_lock(thread);
+	/*
+	 * Once the thread is started, we will look at `ith_voucher` without
+	 * holding any lock.
+	 *
+	 * Setting the voucher hence can only be done by current_thread() or
+	 * before it started. "started" flips under the thread mutex and must be
+	 * tested under it too.
+	 */
+	if (thread != current_thread() && thread->started) {
+		thread_mtx_unlock(thread);
+		return KERN_INVALID_ARGUMENT;
+	}
+
+	ipc_voucher_reference(voucher);
+	old_voucher = thread->ith_voucher;
+	thread->ith_voucher = voucher;
+	thread->ith_voucher_name = MACH_PORT_NULL;
+	thread_mtx_unlock(thread);
+
+	bank_swap_thread_bank_ledger(thread, bankledger);
+#if CONFIG_THREAD_GROUPS
+	thread_group_set_bank(thread, banktg);
+#endif /* CONFIG_THREAD_GROUPS */
+
+	ipc_voucher_release(old_voucher);
+
+	return KERN_SUCCESS;
+}
+
 
 kern_return_t thread_set_policy(thread_t thread, processor_set_t pset, policy_t policy, policy_base_t base, mach_msg_type_number_t base_count, policy_limit_t limit, mach_msg_type_number_t limit_count) {
 	dtape_stub_unsafe();

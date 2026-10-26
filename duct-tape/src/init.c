@@ -100,6 +100,11 @@ void dtape_init(const dtape_hooks_t* hooks) {
 	dtape_log_debug("host_notify_init");
 	host_notify_init();
 
+	extern void dtape_bank_ledger_init(void);
+	extern void bank_init(void);
+	dtape_bank_ledger_init();
+	bank_init();
+
 	dtape_log_debug("user_data_attr_manager_init");
 	user_data_attr_manager_init();
 

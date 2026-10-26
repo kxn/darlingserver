@@ -191,6 +191,11 @@ bank_init()
 {
 	kern_return_t kr = KERN_SUCCESS;
 
+#ifdef DARLING
+	bank_task_zone=zone_create("bank_task",sizeof(struct bank_task),ZC_NONE);
+	bank_account_zone=zone_create("bank_account",sizeof(struct bank_account),ZC_NONE);
+	lck_spin_init(&g_bank_task_lock_data,&bank_lock_grp,&bank_lock_attr);
+#endif
 	init_bank_ledgers();
 
 	/* Register the bank manager with the Vouchers sub system. */
@@ -897,16 +902,16 @@ bank_task_alloc_init(task_t task)
 	 */
 	bzero(&new_bank_task->bt_proc_persona, sizeof(new_bank_task->bt_proc_persona));
 	new_bank_task->bt_flags = 0;
-	new_bank_task->bt_unique_pid = proc_uniqueid(task->bsd_info);
-	new_bank_task->bt_pid = proc_pid(task->bsd_info);
-	new_bank_task->bt_pidversion = proc_pidversion(task->bsd_info);
-	new_bank_task->bt_persona_id = proc_persona_id(task->bsd_info);
-	new_bank_task->bt_uid = proc_getuid(task->bsd_info);
-	new_bank_task->bt_gid = proc_getgid(task->bsd_info);
+	new_bank_task->bt_unique_pid = proc_uniqueid(get_bsdtask_info(task));
+	new_bank_task->bt_pid = proc_pid(get_bsdtask_info(task));
+	new_bank_task->bt_pidversion = proc_pidversion(get_bsdtask_info(task));
+	new_bank_task->bt_persona_id = proc_persona_id(get_bsdtask_info(task));
+	new_bank_task->bt_uid = proc_getuid(get_bsdtask_info(task));
+	new_bank_task->bt_gid = proc_getgid(get_bsdtask_info(task));
 #if CONFIG_THREAD_GROUPS
 	new_bank_task->bt_thread_group = thread_group_retain(task_coalition_get_thread_group(task));
 #endif
-	proc_getexecutableuuid(task->bsd_info, new_bank_task->bt_macho_uuid, sizeof(new_bank_task->bt_macho_uuid));
+	proc_getexecutableuuid(get_bsdtask_info(task), new_bank_task->bt_macho_uuid, sizeof(new_bank_task->bt_macho_uuid));
 
 #if DEVELOPMENT || DEBUG
 	new_bank_task->bt_task = NULL;
@@ -951,7 +956,12 @@ static boolean_t
 bank_task_is_persona_modify_entitled(task_t t)
 {
 	boolean_t entitled = FALSE;
+#ifdef DARLING
+	/* No alternate-persona service is installed for this target. */
+	return FALSE;
+#else
 	entitled = IOTaskHasEntitlement(t, ENTITLEMENT_PERSONA_MODIFY);
+#endif
 	return entitled;
 }
 
@@ -1071,7 +1081,13 @@ get_bank_task_context
     boolean_t initialize)
 {
 	bank_task_t bank_task;
-
+#ifdef DARLING
+	/* Linux tasks acquire Bank state lazily after their audit identity and
+	 * process generation have been supplied by the server. */
+	extern void dtape_bank_prepare_task(task_t);
+	dtape_bank_prepare_task(task);
+	initialize=TRUE;
+#endif
 	if (task->bank_context || !initialize) {
 		assert(task->bank_context != NULL);
 		return task->bank_context;

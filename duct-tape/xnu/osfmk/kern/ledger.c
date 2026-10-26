@@ -31,6 +31,9 @@
 
 #include <kern/kern_types.h>
 #include <kern/ledger.h>
+#ifdef DARLING
+extern ledger_t coalition_ledger_get_from_task(task_t task);
+#endif
 #include <kern/kalloc.h>
 #include <kern/task.h>
 #include <kern/thread.h>

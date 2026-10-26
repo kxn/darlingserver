@@ -271,6 +271,9 @@ add_library(darlingserver_duct_tape STATIC
 	src/psynch.c
 	src/condvar.c
 	src/debug.c
+	src/bank_compat.c
+	xnu/osfmk/bank/bank.c
+	xnu/osfmk/kern/ledger.c
 
 	xnu/libkern/os/refcnt.c
 	xnu/libkern/gen/OSAtomicOperations.c

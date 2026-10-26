@@ -169,6 +169,8 @@ void dtape_task_destroy(dtape_task_t* task) {
 
 	ipc_task_terminate(&task->xnu_task);
 
+	extern void dtape_bank_destroy_task(task_t);
+	dtape_bank_destroy_task(&task->xnu_task);
 	dtape_vm_map_destroy(task->xnu_task.map);
 
 	is_release(task->xnu_task.itk_space);
