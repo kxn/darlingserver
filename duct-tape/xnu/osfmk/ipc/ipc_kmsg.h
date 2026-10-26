@@ -156,7 +156,14 @@ struct ipc_kmsg {
  *	IKM_SAVED_KMSG_SIZE includes overhead; IKM_SAVED_MSG_SIZE doesn't.
  */
 extern zone_t ipc_kmsg_zone;
+#ifdef DARLING
+/* Keep the original inline payload capacity after adding the auxiliary pointer
+ * and size. Otherwise mk_timer's preallocated message spills into heap storage
+ * and its data pointer aliases the preallocation-port union. */
+#define IKM_SAVED_KMSG_SIZE     (256 + 2 * sizeof(void *))
+#else
 #define IKM_SAVED_KMSG_SIZE     256
+#endif
 #define IKM_SAVED_MSG_SIZE      ikm_less_overhead(IKM_SAVED_KMSG_SIZE)
 
 #define ikm_prealloc_inuse_port(kmsg)                                   \
