@@ -363,6 +363,12 @@ mach_msg_receive_results(
 						mr = MACH_RCV_INVALID_DATA;
 					}
 				}
+#ifdef DARLING
+				if (self->darling_vector_receive && self->darling_aux_receive_addr &&
+				    copyout(&self->darling_aux_required, self->darling_aux_receive_addr, sizeof(mach_msg_size_t))) {
+					mr = MACH_RCV_INVALID_DATA;
+				}
+#endif
 			} else {
 				/* discard importance in message */
 				ipc_importance_clean(kmsg);
@@ -377,6 +383,9 @@ mach_msg_receive_results(
 		if (sizep) {
 			*sizep = size;
 		}
+#ifdef DARLING
+		self->darling_vector_receive = FALSE;
+#endif
 		return mr;
 	}
 
@@ -426,6 +435,9 @@ mach_msg_receive_results(
 	if (sizep) {
 		*sizep = size;
 	}
+#ifdef DARLING
+	self->darling_vector_receive = FALSE;
+#endif
 	return mr;
 }
 
@@ -469,6 +481,11 @@ mach_msg_receive(
 	/* hold ref for object */
 
 	self->ith_msg_addr = CAST_DOWN(mach_vm_address_t, msg);
+#ifdef DARLING
+	self->darling_vector_receive = FALSE;
+	self->darling_aux_receive_addr = 0;
+	self->darling_aux_receive_size = self->darling_aux_required = 0;
+#endif
 	self->ith_object = object;
 	self->ith_rsize = rcv_size;
 	self->ith_msize = 0;
@@ -509,10 +526,16 @@ mach_msg_receive_continue(void)
  *		All of mach_msg_send and mach_msg_receive error codes.
  */
 
+struct darling_mach_msg_aux_context {
+	mach_vm_address_t send_address, receive_address;
+	mach_msg_size_t send_size, receive_size;
+};
+
 static mach_msg_return_t
 mach_msg_overwrite_with_header(
 	struct mach_msg_overwrite_trap_args *args,
-	const darling_mach_msg_capture_t *captured)
+	const darling_mach_msg_capture_t *captured,
+	const struct darling_mach_msg_aux_context *auxiliary)
 {
 	mach_vm_address_t       msg_addr = args->msg;
 	mach_msg_option_t       option = args->option;
@@ -526,6 +549,11 @@ mach_msg_overwrite_with_header(
 
 	mach_msg_return_t  mr = MACH_MSG_SUCCESS;
 	vm_map_t map = current_map();
+#ifdef DARLING
+	current_thread()->darling_vector_receive = FALSE;
+	current_thread()->darling_aux_receive_addr = 0;
+	current_thread()->darling_aux_receive_size = current_thread()->darling_aux_required = 0;
+#endif
 
 	/* Only accept options allowed by the user */
 	option &= MACH_MSG_OPTION_USER;
@@ -541,6 +569,10 @@ mach_msg_overwrite_with_header(
 		if (mr != MACH_MSG_SUCCESS) {
 			KDBG(MACHDBG_CODE(DBG_MACH_IPC, MACH_IPC_KMSG_INFO) | DBG_FUNC_END, mr);
 			return mr;
+		}
+		if (auxiliary && auxiliary->send_size) {
+			mr = ipc_kmsg_add_aux_data(kmsg, auxiliary->send_address, auxiliary->send_size);
+			if (mr != MACH_MSG_SUCCESS) { ipc_kmsg_free(kmsg); return mr; }
 		}
 
 		KERNEL_DEBUG_CONSTANT(MACHDBG_CODE(DBG_MACH_IPC, MACH_IPC_KMSG_LINK) | DBG_FUNC_NONE,
@@ -569,6 +601,12 @@ mach_msg_overwrite_with_header(
 
 	if (option & MACH_RCV_MSG) {
 		thread_t self = current_thread();
+#ifdef DARLING
+		self->darling_vector_receive = auxiliary != NULL;
+		self->darling_aux_receive_addr = auxiliary ? auxiliary->receive_address : 0;
+		self->darling_aux_receive_size = auxiliary ? auxiliary->receive_size : 0;
+		self->darling_aux_required = 0;
+#endif
 		ipc_space_t space = current_space();
 		ipc_object_t object;
 		ipc_mqueue_t mqueue;
@@ -620,7 +658,7 @@ end:
 mach_msg_return_t
 mach_msg_overwrite_trap(struct mach_msg_overwrite_trap_args *args)
 {
-	return mach_msg_overwrite_with_header(args, NULL);
+	return mach_msg_overwrite_with_header(args, NULL, NULL);
 }
 
 #ifdef DARLING
@@ -632,8 +670,8 @@ mach_msg_overwrite_trap(struct mach_msg_overwrite_trap_args *args)
 #define DARLING_MACH_RCV_INVALID_ARGUMENTS 0x10004013
 
 /* Message vector ABI and validation order follow apple-oss-distributions/xnu
- * f6217f891ac0bb64f3d375211650a4c1ff8ca1ea. The existing IPC backend carries
- * no auxiliary payload, so nonempty auxiliary sends remain unsupported.
+ * f6217f891ac0bb64f3d375211650a4c1ff8ca1ea. Auxiliary data is owned by the
+ * actual kernel message from copyin through queueing, copyout and destruction.
  */
 struct darling_mach_msg_vector {
 	uint64_t data, receive_address;
@@ -652,6 +690,7 @@ darling_mach_msg2_vectors(struct mach_msg2_trap_args *args,
 	uint32_t count = send_count > receive_count ? send_count : receive_count;
 	uint64_t options = args->options;
 	boolean_t sending = (options & MACH_SEND_MSG) != 0;
+	struct darling_mach_msg_aux_context auxiliary = {0};
 	if (count > 2) return sending ? MACH_SEND_INVALID_DATA : DARLING_MACH_RCV_INVALID_ARGUMENTS;
 	if (!count) return sending ? MACH_SEND_MSG_TOO_SMALL : DARLING_MACH_RCV_INVALID_ARGUMENTS;
 	if (copyin(args->data, vectors, count * sizeof(vectors[0])))
@@ -661,21 +700,26 @@ darling_mach_msg2_vectors(struct mach_msg2_trap_args *args,
 		if (!vectors[0].data) return MACH_SEND_INVALID_DATA;
 		if (vectors[0].send_size < sizeof(mach_msg_user_header_t) || (vectors[0].send_size & 3))
 			return MACH_SEND_MSG_TOO_SMALL;
-		if (send_count == 2 && vectors[1].send_size)
-			return DARLING_MACH_SEND_INVALID_OPTIONS;
+		if (send_count == 2) {
+			auxiliary.send_address = vectors[1].data;
+			auxiliary.send_size = vectors[1].send_size;
+			if (auxiliary.send_size && !auxiliary.send_address) return MACH_SEND_INVALID_DATA;
+			if (auxiliary.send_size && auxiliary.send_size < 8) return 0x10000018;
+			if (auxiliary.send_size > DARLING_MACH_MSG_AUX_MAX) return 0x10000019;
+		}
 		legacy->msg = vectors[0].data;
 		legacy->send_size = vectors[0].send_size;
 		legacy->option = (uint32_t)options & ~MACH_RCV_MSG;
-		mach_msg_return_t result = mach_msg_overwrite_with_header(legacy, captured);
+		mach_msg_return_t result = mach_msg_overwrite_with_header(legacy, captured, &auxiliary);
 		if (result != MACH_MSG_SUCCESS) return result;
 	}
 	if (!(options & MACH_RCV_MSG)) return MACH_MSG_SUCCESS;
 	/* Invalid receive arguments must not prevent a valid combined send. */
 	if (!receive_count) return DARLING_MACH_RCV_INVALID_ARGUMENTS;
-	uint64_t auxiliary = 0;
 	if (receive_count == 2) {
-		auxiliary = vectors[1].receive_address ? vectors[1].receive_address : vectors[1].data;
-		if (!auxiliary || vectors[1].receive_size < 8) return DARLING_MACH_RCV_INVALID_ARGUMENTS;
+		auxiliary.receive_address = vectors[1].receive_address ? vectors[1].receive_address : vectors[1].data;
+		auxiliary.receive_size = vectors[1].receive_size;
+		if (!auxiliary.receive_address || auxiliary.receive_size < 8) return DARLING_MACH_RCV_INVALID_ARGUMENTS;
 	}
 	legacy->msg = vectors[0].receive_address ? vectors[0].receive_address : vectors[0].data;
 	legacy->rcv_msg = 0;
@@ -683,14 +727,7 @@ darling_mach_msg2_vectors(struct mach_msg2_trap_args *args,
 	legacy->send_size = 0;
 	legacy->option = (uint32_t)options & ~MACH_SEND_MSG;
 	if (options & MACH_RCV_SYNC_WAIT) legacy->priority = captured->header.msgh_remote_port;
-	mach_msg_return_t result = mach_msg_overwrite_with_header(legacy, NULL);
-	if (result == MACH_MSG_SUCCESS && auxiliary) {
-		/* All accepted sends carry no auxiliary bytes. The specified empty
-		 * header is real absence, and no user payload is discarded. */
-		uint32_t empty_header[2] = {0, 0};
-		if (copyout(empty_header, auxiliary, sizeof(empty_header))) return MACH_RCV_INVALID_DATA;
-	}
-	return result;
+	return mach_msg_overwrite_with_header(legacy, NULL, &auxiliary);
 }
 
 mach_msg_return_t
@@ -701,8 +738,7 @@ mach_msg2_trap(struct mach_msg2_trap_args *args)
 	const uint64_t supported = (uint32_t)MACH_MSG_OPTION_USER | selectors | DARLING_MACH64_VECTOR;
 	uint64_t options = args->options;
 	uint64_t selected = options & selectors;
-	/* Unknown options remain explicit errors. Nonempty auxiliary sends are
-	 * rejected by the vector path before any message rights are consumed. */
+	/* Unknown options remain explicit errors. */
 	if ((options & ~supported) ||
 	    ((options & MACH_SEND_MSG) && (!selected || (selected & (selected - 1))))) {
 		return DARLING_MACH_SEND_INVALID_OPTIONS;
@@ -746,7 +782,7 @@ mach_msg2_trap(struct mach_msg2_trap_args *args)
 		old.priority = captured.header.msgh_remote_port;
 	}
 	if (options & DARLING_MACH64_VECTOR) return darling_mach_msg2_vectors(args, &old, &captured);
-	return mach_msg_overwrite_with_header(&old, &captured);
+	return mach_msg_overwrite_with_header(&old, &captured, NULL);
 }
 #endif
 

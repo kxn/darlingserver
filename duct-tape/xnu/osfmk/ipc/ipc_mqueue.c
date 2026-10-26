@@ -106,6 +106,17 @@ extern char     *proc_name_address(void *p);
 int ipc_mqueue_full;            /* address is event for queue space */
 int ipc_mqueue_rcv;             /* address is event for message arrival */
 
+static boolean_t
+darling_aux_too_large(thread_t thread, ipc_kmsg_t message)
+{
+#ifdef DARLING
+	thread->darling_aux_required = message->ikm_aux_size;
+	return thread->darling_vector_receive && thread->darling_aux_receive_size < message->ikm_aux_size;
+#else
+	return FALSE;
+#endif
+}
+
 /* forward declarations */
 static void ipc_mqueue_receive_results(wait_result_t result);
 static void ipc_mqueue_peek_on_thread(
@@ -377,7 +388,7 @@ ipc_mqueue_add(
 			 * just move onto the next.
 			 */
 			msize = ipc_kmsg_copyout_size(kmsg, th->map);
-			if (th->ith_rsize <
+			if (darling_aux_too_large(th, kmsg) || th->ith_rsize <
 			    (msize + REQUESTED_TRAILER_SIZE(thread_is_64bit_addr(th), th->ith_option))) {
 				th->ith_state = MACH_RCV_TOO_LARGE;
 				th->ith_msize = msize;
@@ -863,7 +874,7 @@ ipc_mqueue_post(
 		 * the thread we wake up will get that as its status.
 		 */
 		msize = ipc_kmsg_copyout_size(kmsg, receiver->map);
-		if (receiver->ith_rsize <
+		if (darling_aux_too_large(receiver, kmsg) || receiver->ith_rsize <
 		    (msize + REQUESTED_TRAILER_SIZE(thread_is_64bit_addr(receiver), receiver->ith_option))) {
 			receiver->ith_msize = msize;
 			receiver->ith_state = MACH_RCV_TOO_LARGE;
@@ -1322,7 +1333,7 @@ ipc_mqueue_select_on_thread(
 	 * (and size needed).
 	 */
 	msize = ipc_kmsg_copyout_size(kmsg, thread->map);
-	if (msize + REQUESTED_TRAILER_SIZE(thread_is_64bit_addr(thread), option) > max_size) {
+	if (darling_aux_too_large(thread, kmsg) || msize + REQUESTED_TRAILER_SIZE(thread_is_64bit_addr(thread), option) > max_size) {
 		mr = MACH_RCV_TOO_LARGE;
 		if (option & MACH_RCV_LARGE) {
 			thread->ith_receiver_name = port_mq->imq_receiver_name;

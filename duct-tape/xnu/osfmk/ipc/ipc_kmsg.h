@@ -118,6 +118,10 @@ struct ipc_kmsg {
 	struct mach_node           *ikm_node;        /* Originating node - needed for ack */
 #endif
 	mach_msg_size_t            ikm_size;
+#ifdef DARLING
+	void                     *ikm_aux_data;
+	mach_msg_size_t            ikm_aux_size;
+#endif
 	uint32_t                   ikm_ppriority;    /* pthread priority of this kmsg */
 #if IKM_PARTIAL_SIG
 	uintptr_t                  ikm_header_sig;   /* sig for just the header */
@@ -287,6 +291,9 @@ typedef struct {
 extern mach_msg_return_t ipc_kmsg_get_with_header(
 	mach_vm_address_t msg_addr, mach_msg_size_t size,
 	const darling_mach_msg_capture_t *captured, ipc_kmsg_t *kmsgp);
+#define DARLING_MACH_MSG_AUX_MAX 1024 /* paired modern XNU ipc_policy.h */
+extern mach_msg_return_t ipc_kmsg_add_aux_data(
+	ipc_kmsg_t kmsg, mach_vm_address_t address, mach_msg_size_t size);
 #endif
 
 /* Allocate a kernel message buffer and copy a kernel message to the buffer */

@@ -653,6 +653,13 @@ struct thread {
 
 	mach_port_name_t        ith_voucher_name;
 	ipc_voucher_t           ith_voucher;
+#ifdef DARLING
+	/* Modern vector receive state; owned by this thread's active IPC call. */
+	boolean_t              darling_vector_receive;
+	mach_vm_address_t      darling_aux_receive_addr;
+	mach_msg_size_t        darling_aux_receive_size;
+	mach_msg_size_t        darling_aux_required;
+#endif
 #if CONFIG_IOSCHED
 	void                   *decmp_upl;
 #endif /* CONFIG_IOSCHED */

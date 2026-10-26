@@ -1348,6 +1348,13 @@ ipc_kmsg_free(
 {
 	mach_msg_size_t size = kmsg->ikm_size;
 	ipc_port_t port;
+#ifdef DARLING
+	if (kmsg->ikm_aux_data) {
+		kheap_free(KHEAP_DATA_BUFFERS, kmsg->ikm_aux_data, kmsg->ikm_aux_size);
+		kmsg->ikm_aux_data = NULL;
+		kmsg->ikm_aux_size = 0;
+	}
+#endif
 
 	assert(!IP_VALID(kmsg->ikm_voucher));
 
@@ -2069,6 +2076,31 @@ ipc_kmsg_get_with_header(
 	return MACH_MSG_SUCCESS;
 }
 
+#ifdef DARLING
+mach_msg_return_t
+ipc_kmsg_add_aux_data(ipc_kmsg_t kmsg, mach_vm_address_t address, mach_msg_size_t size)
+{
+	if (!size) return MACH_MSG_SUCCESS;
+	if (!address) return MACH_SEND_INVALID_DATA;
+	if (size < 8) return 0x10000018; /* MACH_SEND_AUX_TOO_SMALL */
+	if (size > DARLING_MACH_MSG_AUX_MAX) return 0x10000019; /* MACH_SEND_AUX_TOO_LARGE */
+	if (address > UINT64_MAX - size) return MACH_SEND_INVALID_DATA;
+	void *bytes = kheap_alloc(KHEAP_DATA_BUFFERS, size, Z_WAITOK);
+	if (!bytes) return MACH_SEND_NO_BUFFER;
+	/* The kernel synthesizes the header; its caller-supplied fields are not
+	 * trusted. Copy opaque auxiliary bytes after it, as modern XNU does. */
+	((uint32_t *)bytes)[0] = size;
+	((uint32_t *)bytes)[1] = 0;
+	if (size > 8 && copyinmsg(address + 8, (char *)bytes + 8, size - 8)) {
+		kheap_free(KHEAP_DATA_BUFFERS, bytes, size);
+		return MACH_SEND_INVALID_DATA;
+	}
+	kmsg->ikm_aux_data = bytes;
+	kmsg->ikm_aux_size = size;
+	return MACH_MSG_SUCCESS;
+}
+#endif
+
 mach_msg_return_t
 ipc_kmsg_get(mach_vm_address_t msg_addr, mach_msg_size_t size, ipc_kmsg_t *kmsgp)
 {
@@ -2516,6 +2548,17 @@ ipc_kmsg_put(
 	} else {
 		mr = MACH_MSG_SUCCESS;
 	}
+
+#ifdef DARLING
+	thread_t receiver = current_thread();
+	if (mr == MACH_MSG_SUCCESS && receiver->darling_vector_receive && receiver->darling_aux_receive_addr) {
+		uint32_t empty_header[2] = {0, 0};
+		const void *auxiliary = kmsg->ikm_aux_size ? kmsg->ikm_aux_data : empty_header;
+		mach_msg_size_t auxiliary_size = kmsg->ikm_aux_size ? kmsg->ikm_aux_size : sizeof(empty_header);
+		if (auxiliary_size <= receiver->darling_aux_receive_size &&
+		    copyoutmsg(auxiliary, receiver->darling_aux_receive_addr, auxiliary_size)) mr = MACH_RCV_INVALID_DATA;
+	}
+#endif
 
 	KERNEL_DEBUG_CONSTANT(MACHDBG_CODE(DBG_MACH_IPC, MACH_IPC_KMSG_LINK) | DBG_FUNC_NONE,
 	    (rcv_addr >= VM_MIN_KERNEL_AND_KEXT_ADDRESS ||
