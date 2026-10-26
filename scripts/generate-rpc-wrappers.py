@@ -701,6 +701,12 @@ calls.append(('eventlink_signal', [('port','uint32_t'),('signal_count','uint64_t
 calls.append(('eventlink_wait', [('port','uint32_t'),('wait_count','uint64_t'),('deadline','uint64_t'),('clock_id','uint32_t'),('options','uint32_t')], [('value','uint64_t')], ALLOW_INTERRUPTIONS))
 calls.append(('eventlink_signal_wait', [('port','uint32_t'),('wait_count','uint64_t'),('signal_count','uint64_t'),('deadline','uint64_t'),('clock_id','uint32_t'),('options','uint32_t')], [('value','uint64_t')], ALLOW_INTERRUPTIONS))
 
+# Append-only routing to the original server-wide XNU activity-ID allocator.
+calls.append(('mach_generate_activity_id', [
+	('target', 'uint32_t'), ('count', 'int32_t'),
+	('activity_id', 'uint64_t*', 'uint64_t'),
+], [], XNU_TRAP_CALL | XNU_TRAP_NOPREFIX | XNU_TRAP_NOSUFFIX))
+
 ALLOWED_PRIVATE_TYPES = [
 	'bool',
 	'int8_t',
