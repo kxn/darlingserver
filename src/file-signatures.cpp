@@ -45,10 +45,7 @@ bool strongKey(X509* cert) {
     int type=EVP_PKEY_base_id(key),bits=EVP_PKEY_bits(key);
     return ((type==EVP_PKEY_RSA || type==EVP_PKEY_RSA_PSS) && bits>=2048) || (type==EVP_PKEY_EC && bits>=256);
 }
-bool softwareLeaf(X509* leaf) {
-    std::unique_ptr<ASN1_OBJECT,decltype(&ASN1_OBJECT_free)> marker(OBJ_txt2obj("1.2.840.113635.100.6.22",1),ASN1_OBJECT_free);
-    int at=X509_get_ext_by_OBJ(leaf,marker.get(),-1);
-    if (at<0 || X509_get_ext_by_OBJ(leaf,marker.get(),at)>=0) return false;
+bool codeSigningLeaf(X509* leaf) {
     std::unique_ptr<EXTENDED_KEY_USAGE,decltype(&EXTENDED_KEY_USAGE_free)> eku(
         static_cast<EXTENDED_KEY_USAGE*>(X509_get_ext_d2i(leaf,NID_ext_key_usage,nullptr,nullptr)),EXTENDED_KEY_USAGE_free);
     if (!eku) return false;
@@ -56,7 +53,31 @@ bool softwareLeaf(X509* leaf) {
         if (OBJ_obj2nid(sk_ASN1_OBJECT_value(eku.get(),i))==NID_code_sign) return strongKey(leaf);
     return false;
 }
-bool verifyCMS(const unsigned char* encoded,size_t size,const unsigned char* directory,size_t directorySize) {
+bool softwareLeaf(X509* leaf) {
+    std::unique_ptr<ASN1_OBJECT,decltype(&ASN1_OBJECT_free)> marker(OBJ_txt2obj("1.2.840.113635.100.6.22",1),ASN1_OBJECT_free);
+    int at=X509_get_ext_by_OBJ(leaf,marker.get(),-1);
+    return at>=0 && X509_get_ext_by_OBJ(leaf,marker.get(),at)<0 && codeSigningLeaf(leaf);
+}
+int verifyKnownAppleCriticalExtension(int ok,X509_STORE_CTX* ctx) {
+    if(ok || X509_STORE_CTX_get_error(ctx)!=X509_V_ERR_UNHANDLED_CRITICAL_EXTENSION)return ok;
+    // OpenSSL does not know Apple's Developer ID Application certificate
+    // marker. Recognize exactly that leaf marker, whose value must be DER NULL;
+    // leave every other unknown critical extension as a verification failure.
+    if(X509_STORE_CTX_get_error_depth(ctx)!=0)return 0;
+    X509* cert=X509_STORE_CTX_get_current_cert(ctx);bool found=false;
+    for(int i=0;i<X509_get_ext_count(cert);++i) {
+        X509_EXTENSION* ext=X509_get_ext(cert,i);
+        if(!X509_EXTENSION_get_critical(ext) || X509_supported_extension(ext))continue;
+        char oid[100]={};OBJ_obj2txt(oid,sizeof(oid),X509_EXTENSION_get_object(ext),1);
+        const ASN1_OCTET_STRING* data=X509_EXTENSION_get_data(ext);
+        if(found || std::strcmp(oid,"1.2.840.113635.100.6.1.13") ||
+            ASN1_STRING_length(data)!=2 || std::memcmp(ASN1_STRING_get0_data(data),"\x05\x00",2))return 0;
+        found=true;
+    }
+    if(!found || !codeSigningLeaf(cert))return 0;
+    X509_STORE_CTX_set_error(ctx,X509_V_OK);return 1;
+}
+bool verifyCMS(const unsigned char* encoded,size_t size,const unsigned char* directory,size_t directorySize,bool platformOnly) {
     if (size>LONG_MAX || directorySize>INT_MAX) return false;
     const unsigned char* cursor=encoded;
     std::unique_ptr<CMS_ContentInfo,decltype(&CMS_ContentInfo_free)> cms(d2i_CMS_ContentInfo(nullptr,&cursor,size),CMS_ContentInfo_free);
@@ -76,15 +97,20 @@ bool verifyCMS(const unsigned char* encoded,size_t size,const unsigned char* dir
     // Anchor, CMS signature, issuer, leaf marker, EKU and key checks remain.
     if (!X509_STORE_set_flags(store.get(),X509_V_FLAG_NO_CHECK_TIME) ||
         !X509_STORE_set_purpose(store.get(),X509_PURPOSE_ANY)) return false;
+    if(!platformOnly)X509_STORE_set_verify_cb(store.get(),verifyKnownAppleCriticalExtension);
     std::unique_ptr<BIO,decltype(&BIO_free)> data(BIO_new_mem_buf(directory,directorySize),BIO_free);
     std::unique_ptr<BIO,decltype(&BIO_free)> sink(BIO_new(BIO_s_null()),BIO_free);
     if (!data || !sink || CMS_verify(cms.get(),nullptr,store.get(),data.get(),sink.get(),CMS_BINARY)!=1) return false;
     X509* leaf=nullptr;CMS_SignerInfo_get0_algs(sk_CMS_SignerInfo_value(signers,0),nullptr,&leaf,nullptr,nullptr);
-    if (!leaf || !softwareLeaf(leaf)) return false;
+    if (!leaf || !(platformOnly?softwareLeaf(leaf):codeSigningLeaf(leaf))) return false;
     Certs certificates;certificates.value=CMS_get1_certs(cms.get());
     std::unique_ptr<X509_STORE_CTX,decltype(&X509_STORE_CTX_free)> ctx(X509_STORE_CTX_new(),X509_STORE_CTX_free);
     if (!ctx || X509_STORE_CTX_init(ctx.get(),store.get(),leaf,certificates.value)!=1 || X509_verify_cert(ctx.get())!=1) return false;
-    auto* chain=X509_STORE_CTX_get0_chain(ctx.get());if (sk_X509_num(chain)!=3) return false;
+    auto* chain=X509_STORE_CTX_get0_chain(ctx.get());
+    int chainSize=sk_X509_num(chain);if(chainSize<2 || chainSize>5) return false;
+    for(int i=0;i<chainSize;++i)if(!strongKey(sk_X509_value(chain,i)))return false;
+    if(!platformOnly)return true;
+    if(chainSize!=3)return false;
     X509* intermediate=sk_X509_value(chain,1);char name[128]={};
     constexpr char required[]="Apple Code Signing Certification Authority";
     int n=X509_NAME_get_text_by_NID(X509_get_subject_name(intermediate),NID_commonName,name,sizeof(name));
@@ -98,7 +124,7 @@ struct Registered {
 std::mutex registrationLock;
 std::vector<std::unique_ptr<Registered>> registrations;
 int failure(int error,const char* text,std::string* reason) { if(reason)*reason=text;return error; }
-int verify(int fd,uint64_t slice,uint64_t signatureOffset,uint64_t signatureSize,uint64_t& covered,std::string* reason) {
+int verify(int fd,uint64_t slice,uint64_t signatureOffset,uint64_t signatureSize,uint64_t& covered,std::string* reason,bool platformOnly) {
     covered=0;struct stat before{};
     if (fstat(fd,&before)) return failure(errno,"descriptor stat failed",reason);
     if (!S_ISREG(before.st_mode)) return failure(EBADF,"descriptor is not a regular file",reason);
@@ -143,13 +169,16 @@ int verify(int fd,uint64_t slice,uint64_t signatureOffset,uint64_t signatureSize
         if (kind>=0x1000 && kind<0x1005) return failure(ENOTSUP,"alternate CodeDirectory not implemented",reason);
     }
     auto cdEntry=blobs.find(0),cmsEntry=blobs.find(0x10000);
-    if (cdEntry==blobs.end() || cmsEntry==blobs.end()) return failure(EPERM,"Apple CMS signature required",reason);
-    Blob cd=cdEntry->second,cms=cmsEntry->second;
-    if (cd.size<44 || be32(cd.bytes)!=0xfade0c02 || be32(cms.bytes)!=0xfade0b01) return failure(EPERM,"invalid signature slot types",reason);
+    if (cdEntry==blobs.end()) return failure(EPERM,"CodeDirectory required",reason);
+    Blob cd=cdEntry->second;
+    if (cd.size<44 || be32(cd.bytes)!=0xfade0c02) return failure(EPERM,"invalid CodeDirectory slot",reason);
     uint32_t version=be32(cd.bytes+8),flags=be32(cd.bytes+12),hashOffset=be32(cd.bytes+16),ident=be32(cd.bytes+20);
     uint32_t special=be32(cd.bytes+24),slots=be32(cd.bytes+28);uint64_t limit=be32(cd.bytes+32);
     unsigned hashSize=cd.bytes[36],hashType=cd.bytes[37],pagePower=cd.bytes[39];
-    if (version<0x20001 || version>0x20600 || flags&2 || pagePower>20 || !pagePower ||
+    bool adHoc=(flags&2)!=0;
+    if (adHoc && (platformOnly || cmsEntry!=blobs.end()))return failure(EPERM,"ad-hoc signature cannot establish Apple platform identity",reason);
+    if (!adHoc && (cmsEntry==blobs.end() || be32(cmsEntry->second.bytes)!=0xfade0b01))return failure(EPERM,"CMS signature required",reason);
+    if (version<0x20001 || version>0x20600 || pagePower>20 || !pagePower ||
         ident<44 || ident>=cd.size || !std::memchr(cd.bytes+ident,0,cd.size-ident)) return failure(EPERM,"unsupported CodeDirectory",reason);
     if (version>=0x20100 && (cd.size<48 || be32(cd.bytes+44))) return failure(ENOTSUP,"scatter CodeDirectory not implemented",reason);
     if (version>=0x20300 && !limit) { if(cd.size<64)return failure(EINVAL,"short CodeDirectory",reason);limit=be64(cd.bytes+56); }
@@ -162,7 +191,8 @@ int verify(int fd,uint64_t slice,uint64_t signatureOffset,uint64_t signatureSize
         return failure(EINVAL,"CodeDirectory coverage bounds",reason);
     // Verify the detached CMS and Apple Software Signing policy before trusting
     // any coverage result or installing an entry in the registration table.
-    if (!verifyCMS(cms.bytes+8,cms.size-8,cd.bytes,cd.size)) return failure(EPERM,"Apple Software Signing CMS validation failed",reason);
+    if (!adHoc && !verifyCMS(cmsEntry->second.bytes+8,cmsEntry->second.size-8,cd.bytes,cd.size,platformOnly))
+        return failure(EPERM,platformOnly?"Apple Software Signing CMS validation failed":"Apple-rooted code-signing CMS validation failed",reason);
     std::vector<unsigned char> page(pageSize);std::array<unsigned char,EVP_MAX_MD_SIZE> hash{};unsigned digestSize=0;
     for (uint32_t i=0;i<slots;++i) {
         uint64_t offset=uint64_t(i)*pageSize;size_t size=std::min(pageSize,limit-offset);
@@ -186,11 +216,16 @@ int verify(int fd,uint64_t slice,uint64_t signatureOffset,uint64_t signatureSize
         registrations.erase(std::remove_if(registrations.begin(),registrations.end(),[&](const auto& prior){return prior->identity.st_dev==after.st_dev && prior->identity.st_ino==after.st_ino && prior->slice==slice;}),registrations.end());
         if(registrations.size()>=256)registrations.erase(registrations.begin());registrations.push_back(std::move(registration));
     }
-    covered=limit;if(reason)*reason="verified and registered Apple-signed code coverage";return 0;
+    covered=limit;if(reason)*reason=adHoc?"verified and registered ad-hoc code coverage":"verified and registered Apple-signed code coverage";return 0;
 }
 }
 int registerSimulatorDyld(int fd,uint64_t slice,uint64_t start,uint64_t size,uint64_t& covered,std::string* reason) {
-    try { return verify(fd,slice,start,size,covered,reason); }
+    try { return verify(fd,slice,start,size,covered,reason,true); }
+    catch(const std::bad_alloc&) {covered=0;return failure(ENOMEM,"allocation failed",reason);}
+    catch(...) {covered=0;return failure(EIO,"signature verification failed",reason);}
+}
+int registerEmbeddedFile(int fd,uint64_t slice,uint64_t start,uint64_t size,uint64_t& covered,std::string* reason) {
+    try { return verify(fd,slice,start,size,covered,reason,false); }
     catch(const std::bad_alloc&) {covered=0;return failure(ENOMEM,"allocation failed",reason);}
     catch(...) {covered=0;return failure(EIO,"signature verification failed",reason);}
 }

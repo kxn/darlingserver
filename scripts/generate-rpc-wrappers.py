@@ -691,6 +691,11 @@ calls.append(('register_simulator_dyld_signature', [
 	('fd', '@fd'), ('signatures', 'uint64_t'),
 ], []))
 
+# Separate from platform-only dyld registration; preserve prior call numbers.
+calls.append(('register_dylib_signature', [
+	('fd', '@fd'), ('signatures', 'uint64_t'),
+], []))
+
 ALLOWED_PRIVATE_TYPES = [
 	'bool',
 	'int8_t',

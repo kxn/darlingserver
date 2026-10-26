@@ -1041,6 +1041,22 @@ void DarlingServer::Call::RegisterSimulatorDyldSignature::processCall() {
     _sendReply(result);
 }
 
+void DarlingServer::Call::RegisterDylibSignature::processCall() {
+    int result = -ESRCH;
+    auto thread = _thread.lock();auto process = thread ? thread->process() : nullptr;
+    if (process) {
+        struct Signatures { uint64_t fileStart, blobStart, blobSize; } input{};
+        uint64_t covered = 0;
+        if (!process->is64Bit()) result = -ENOTSUP;
+        else if (!process->readMemory(_body.signatures, &input, sizeof(input))) result = -EFAULT;
+        else {
+            result = -FileSignatures::registerEmbeddedFile(_body.fd,input.fileStart,input.blobStart,input.blobSize,covered);
+            if (!result && !process->writeMemory(_body.signatures,&covered,sizeof(covered))) result = -EFAULT;
+        }
+    }
+    _sendReply(result);
+}
+
 void DarlingServer::Call::FseventsOpen::processCall() {
     int result=-ESRCH;
     if (auto thread=_thread.lock()) if (auto process=thread->process()) {
