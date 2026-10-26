@@ -629,17 +629,80 @@ mach_msg_overwrite_trap(struct mach_msg_overwrite_trap_args *args)
 #define DARLING_MACH64_MQUEUE       (1ull << 34)
 #define DARLING_MACH64_ANY          (1ull << 35)
 #define DARLING_MACH_SEND_INVALID_OPTIONS 0x10000013
+#define DARLING_MACH_RCV_INVALID_ARGUMENTS 0x10004013
+
+/* Message vector ABI and validation order follow apple-oss-distributions/xnu
+ * f6217f891ac0bb64f3d375211650a4c1ff8ca1ea. The existing IPC backend carries
+ * no auxiliary payload, so nonempty auxiliary sends remain unsupported.
+ */
+struct darling_mach_msg_vector {
+	uint64_t data, receive_address;
+	uint32_t send_size, receive_size;
+};
+_Static_assert(sizeof(struct darling_mach_msg_vector) == 24, "x86_64 message vector ABI");
+
+static mach_msg_return_t
+darling_mach_msg2_vectors(struct mach_msg2_trap_args *args,
+    struct mach_msg_overwrite_trap_args *legacy,
+    const darling_mach_msg_capture_t *captured)
+{
+	struct darling_mach_msg_vector vectors[2] = {0};
+	uint32_t send_count = args->msgh_bits_and_send_size >> 32;
+	uint32_t receive_count = args->rcv_size_and_priority;
+	uint32_t count = send_count > receive_count ? send_count : receive_count;
+	uint64_t options = args->options;
+	boolean_t sending = (options & MACH_SEND_MSG) != 0;
+	if (count > 2) return sending ? MACH_SEND_INVALID_DATA : DARLING_MACH_RCV_INVALID_ARGUMENTS;
+	if (!count) return sending ? MACH_SEND_MSG_TOO_SMALL : DARLING_MACH_RCV_INVALID_ARGUMENTS;
+	if (copyin(args->data, vectors, count * sizeof(vectors[0])))
+		return sending ? MACH_SEND_INVALID_DATA : DARLING_MACH_RCV_INVALID_ARGUMENTS;
+	if (sending) {
+		if (!send_count) return MACH_SEND_MSG_TOO_SMALL;
+		if (!vectors[0].data) return MACH_SEND_INVALID_DATA;
+		if (vectors[0].send_size < sizeof(mach_msg_user_header_t) || (vectors[0].send_size & 3))
+			return MACH_SEND_MSG_TOO_SMALL;
+		if (send_count == 2 && vectors[1].send_size)
+			return DARLING_MACH_SEND_INVALID_OPTIONS;
+		legacy->msg = vectors[0].data;
+		legacy->send_size = vectors[0].send_size;
+		legacy->option = (uint32_t)options & ~MACH_RCV_MSG;
+		mach_msg_return_t result = mach_msg_overwrite_with_header(legacy, captured);
+		if (result != MACH_MSG_SUCCESS) return result;
+	}
+	if (!(options & MACH_RCV_MSG)) return MACH_MSG_SUCCESS;
+	/* Invalid receive arguments must not prevent a valid combined send. */
+	if (!receive_count) return DARLING_MACH_RCV_INVALID_ARGUMENTS;
+	uint64_t auxiliary = 0;
+	if (receive_count == 2) {
+		auxiliary = vectors[1].receive_address ? vectors[1].receive_address : vectors[1].data;
+		if (!auxiliary || vectors[1].receive_size < 8) return DARLING_MACH_RCV_INVALID_ARGUMENTS;
+	}
+	legacy->msg = vectors[0].receive_address ? vectors[0].receive_address : vectors[0].data;
+	legacy->rcv_msg = 0;
+	legacy->rcv_size = vectors[0].receive_size;
+	legacy->send_size = 0;
+	legacy->option = (uint32_t)options & ~MACH_SEND_MSG;
+	if (options & MACH_RCV_SYNC_WAIT) legacy->priority = captured->header.msgh_remote_port;
+	mach_msg_return_t result = mach_msg_overwrite_with_header(legacy, NULL);
+	if (result == MACH_MSG_SUCCESS && auxiliary) {
+		/* All accepted sends carry no auxiliary bytes. The specified empty
+		 * header is real absence, and no user payload is discarded. */
+		uint32_t empty_header[2] = {0, 0};
+		if (copyout(empty_header, auxiliary, sizeof(empty_header))) return MACH_RCV_INVALID_DATA;
+	}
+	return result;
+}
 
 mach_msg_return_t
 mach_msg2_trap(struct mach_msg2_trap_args *args)
 {
 	const uint64_t selectors = DARLING_MACH64_KOBJECT |
 	    DARLING_MACH64_MQUEUE | DARLING_MACH64_ANY;
-	const uint64_t supported = (uint32_t)MACH_MSG_OPTION_USER | selectors;
+	const uint64_t supported = (uint32_t)MACH_MSG_OPTION_USER | selectors | DARLING_MACH64_VECTOR;
 	uint64_t options = args->options;
 	uint64_t selected = options & selectors;
-	/* Vector/auxiliary messages and new lower option bits require separate
-	 * backend support. Reject them explicitly without consuming a message. */
+	/* Unknown options remain explicit errors. Nonempty auxiliary sends are
+	 * rejected by the vector path before any message rights are consumed. */
 	if ((options & ~supported) ||
 	    ((options & MACH_SEND_MSG) && (!selected || (selected & (selected - 1))))) {
 		return DARLING_MACH_SEND_INVALID_OPTIONS;
@@ -682,6 +745,7 @@ mach_msg2_trap(struct mach_msg2_trap_args *args)
 	if ((options & MACH_RCV_SYNC_WAIT) && !(options & MACH_SEND_MSG)) {
 		old.priority = captured.header.msgh_remote_port;
 	}
+	if (options & DARLING_MACH64_VECTOR) return darling_mach_msg2_vectors(args, &old, &captured);
 	return mach_msg_overwrite_with_header(&old, &captured);
 }
 #endif
