@@ -259,6 +259,7 @@ add_library(darlingserver_duct_tape STATIC
 	src/stubs.c
 	src/locks.c
 	src/memory.c
+	src/eventlink.c
 	src/task.c
 	src/thread.c
 	src/timer.c

@@ -480,6 +480,10 @@ void (thread_reference)(thread_t thread) {
 };
 
 void thread_deallocate(thread_t xthread) {
+	/* MIG destroys nullable thread arguments (e.g. associate-on-wait). */
+	if (xthread == THREAD_NULL) {
+		return;
+	}
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
 	if (os_ref_release(&xthread->ref_count) > 0) {
 		return;

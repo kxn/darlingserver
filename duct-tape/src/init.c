@@ -34,6 +34,7 @@ void mig_init(void);
 void host_notify_init(void);
 void user_data_attr_manager_init(void);
 void ipc_voucher_init(void);
+void ipc_eventlink_init(void);
 
 void dtape_timer_init(void);
 void dtape_mk_timer_init(void);
@@ -50,6 +51,7 @@ void dtape_init(const dtape_hooks_t* hooks) {
 	ipc_space_zone = zone_create("ipc spaces", sizeof(struct ipc_space), ZC_NOENCRYPT);
 	ipc_kmsg_zone = zone_create("ipc kmsgs", IKM_SAVED_KMSG_SIZE, ZC_CACHING | ZC_ZFREE_CLEARMEM);
 	semaphore_zone = zone_create("semaphores", sizeof(struct semaphore), ZC_NONE);
+	ipc_eventlink_init();
 
 	ipc_object_zones[IOT_PORT] = zone_create("ipc ports", sizeof(struct ipc_port), ZC_NOENCRYPT | ZC_CACHING | ZC_ZFREE_CLEARMEM | ZC_NOSEQUESTER);
 	ipc_object_zones[IOT_PORT_SET] = zone_create("ipc port sets", sizeof(struct ipc_pset), ZC_NOENCRYPT | ZC_ZFREE_CLEARMEM | ZC_NOSEQUESTER);

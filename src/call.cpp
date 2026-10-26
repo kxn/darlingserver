@@ -1057,6 +1057,16 @@ void DarlingServer::Call::RegisterDylibSignature::processCall() {
     _sendReply(result);
 }
 
+void DarlingServer::Call::EventlinkSignal::processCall() {
+    _sendReply(0,dtape_eventlink_signal(_body.port,_body.signal_count));
+}
+void DarlingServer::Call::EventlinkWait::processCall() {
+    _sendReply(0,dtape_eventlink_wait(_body.port,_body.wait_count,_body.deadline,_body.clock_id,_body.options));
+}
+void DarlingServer::Call::EventlinkSignalWait::processCall() {
+    _sendReply(0,dtape_eventlink_signal_wait(_body.port,_body.wait_count,_body.signal_count,_body.deadline,_body.clock_id,_body.options));
+}
+
 void DarlingServer::Call::FseventsOpen::processCall() {
     int result=-ESRCH;
     if (auto thread=_thread.lock()) if (auto process=thread->process()) {

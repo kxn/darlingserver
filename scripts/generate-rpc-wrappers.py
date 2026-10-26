@@ -696,6 +696,11 @@ calls.append(('register_dylib_signature', [
 	('fd', '@fd'), ('signatures', 'uint64_t'),
 ], []))
 
+# Preserve the full encoded event count/kernel error separately from transport status.
+calls.append(('eventlink_signal', [('port','uint32_t'),('signal_count','uint64_t')], [('value','uint64_t')]))
+calls.append(('eventlink_wait', [('port','uint32_t'),('wait_count','uint64_t'),('deadline','uint64_t'),('clock_id','uint32_t'),('options','uint32_t')], [('value','uint64_t')], ALLOW_INTERRUPTIONS))
+calls.append(('eventlink_signal_wait', [('port','uint32_t'),('wait_count','uint64_t'),('signal_count','uint64_t'),('deadline','uint64_t'),('clock_id','uint32_t'),('options','uint32_t')], [('value','uint64_t')], ALLOW_INTERRUPTIONS))
+
 ALLOWED_PRIVATE_TYPES = [
 	'bool',
 	'int8_t',

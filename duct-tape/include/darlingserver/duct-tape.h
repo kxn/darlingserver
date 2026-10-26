@@ -21,6 +21,10 @@ void dtape_init(const dtape_hooks_t* hooks);
 void dtape_init_in_thread(void);
 void dtape_deinit(void);
 
+uint64_t dtape_eventlink_signal(uint32_t port, uint64_t signal_count);
+uint64_t dtape_eventlink_wait(uint32_t port, uint64_t wait_count, uint64_t deadline, uint32_t clock_id, uint32_t options);
+uint64_t dtape_eventlink_signal_wait(uint32_t port, uint64_t wait_count, uint64_t signal_count, uint64_t deadline, uint32_t clock_id, uint32_t options);
+
 uint32_t dtape_task_self_trap(void);
 uint32_t dtape_host_self_trap(void);
 uint32_t dtape_thread_self_trap(void);

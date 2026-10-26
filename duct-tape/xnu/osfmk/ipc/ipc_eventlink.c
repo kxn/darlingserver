@@ -53,6 +53,14 @@
 static ZONE_DECLARE(ipc_eventlink_zone, "ipc_eventlink",
     sizeof(struct ipc_eventlink_base), ZC_NONE);
 
+#ifdef __DARLING__
+/* Darling initializes XNU zones explicitly instead of running STARTUP_ARG. */
+void ipc_eventlink_init(void)
+{
+	ipc_eventlink_zone = zone_create("ipc_eventlink", sizeof(struct ipc_eventlink_base), ZC_NONE);
+}
+#endif
+
 os_refgrp_decl(static, ipc_eventlink_refgrp, "eventlink", NULL);
 
 #if DEVELOPMENT || DEBUG
