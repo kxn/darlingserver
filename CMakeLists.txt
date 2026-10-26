@@ -70,6 +70,8 @@ endif()
 
 add_subdirectory(duct-tape)
 
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+
 set(DARLINGSERVER_INIT_PROCESS "/sbin/launchd" CACHE STRING "The init process darlingserver should execute (default is \"/sbin/launchd\")")
 set(DARLINGSERVER_XDG_USER_DIR_CMD "xdg-user-dir" CACHE STRING "The xdg-user-dir binary darlingserver should execute (default is \"xdg-user-dir\")")
 
@@ -110,6 +112,7 @@ add_executable(darlingserver
 	src/server.cpp
 	src/message.cpp
 	src/call.cpp
+	src/file-signatures.cpp
 	src/sandbox-policy.cpp
 	src/fsevents-device.cpp
 	src/fsevents-journal.cpp
@@ -130,6 +133,7 @@ add_dependencies(darlingserver
 
 target_link_libraries(darlingserver PRIVATE
 	darlingserver_duct_tape
+	OpenSSL::Crypto
 )
 
 target_compile_options(darlingserver PRIVATE

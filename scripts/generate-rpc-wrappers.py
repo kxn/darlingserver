@@ -685,6 +685,12 @@ calls.append(('mach_msg2', [
 	('rcv_size_and_priority', 'uint64_t'), ('timeout', 'uint64_t'),
 ], [], XNU_TRAP_CALL | XNU_TRAP_NOPREFIX | ALLOW_INTERRUPTIONS))
 
+# Append only: command 83 transfers the real open file descriptor. Client
+# pointers are accessed through Process memory helpers in the server.
+calls.append(('register_simulator_dyld_signature', [
+	('fd', '@fd'), ('signatures', 'uint64_t'),
+], []))
+
 ALLOWED_PRIVATE_TYPES = [
 	'bool',
 	'int8_t',

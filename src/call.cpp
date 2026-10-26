@@ -33,6 +33,7 @@
 #include <darlingserver/kqchan.hpp>
 #include <darlingserver/sandbox-policy.hpp>
 #include <darlingserver/fsevents-device.hpp>
+#include <darlingserver/file-signatures.hpp>
 
 static DarlingServer::Log callLog("calls");
 
@@ -1017,6 +1018,28 @@ void DarlingServer::Call::InterruptExit::processCall() {
 		}
 	}
 };
+
+void DarlingServer::Call::RegisterSimulatorDyldSignature::processCall() {
+    int result = -ESRCH;
+    auto thread = _thread.lock();
+    auto process = thread ? thread->process() : nullptr;
+    if (process) {
+        struct Signatures { uint64_t fileStart, blobStart, blobSize; } input{};
+        uint64_t covered = 0;
+        if (!process->is64Bit()) result = -ENOTSUP;
+        else if (!process->readMemory(_body.signatures, &input, sizeof(input))) result = -EFAULT;
+        else {
+            std::string reason;
+            result = -FileSignatures::registerSimulatorDyld(_body.fd, input.fileStart,
+                input.blobStart, input.blobSize, covered, &reason);
+            if (!result && !process->writeMemory(_body.signatures, &covered, sizeof(covered))) result = -EFAULT;
+            if (getenv("DARLING_TRACE_FILE_SIGNATURES"))
+                callLog.warning() << "simulator dyld signature: " << reason << "; result=" << result
+                    << "; covered=" << covered << callLog.endLog;
+        }
+    }
+    _sendReply(result);
+}
 
 void DarlingServer::Call::FseventsOpen::processCall() {
     int result=-ESRCH;
