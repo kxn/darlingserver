@@ -176,7 +176,8 @@ int verify(int fd,uint64_t slice,uint64_t signatureOffset,uint64_t signatureSize
     uint32_t special=be32(cd.bytes+24),slots=be32(cd.bytes+28);uint64_t limit=be32(cd.bytes+32);
     unsigned hashSize=cd.bytes[36],hashType=cd.bytes[37],pagePower=cd.bytes[39];
     bool adHoc=(flags&2)!=0;
-    if (adHoc && (platformOnly || cmsEntry!=blobs.end()))return failure(EPERM,"ad-hoc signature cannot establish Apple platform identity",reason);
+    bool emptyCMS=cmsEntry!=blobs.end() && cmsEntry->second.size==8 && be32(cmsEntry->second.bytes)==0xfade0b01;
+    if (adHoc && (platformOnly || (cmsEntry!=blobs.end() && !emptyCMS)))return failure(EPERM,"ad-hoc signature cannot establish Apple platform identity",reason);
     if (!adHoc && (cmsEntry==blobs.end() || be32(cmsEntry->second.bytes)!=0xfade0b01))return failure(EPERM,"CMS signature required",reason);
     if (version<0x20001 || version>0x20600 || pagePower>20 || !pagePower ||
         ident<44 || ident>=cd.size || !std::memchr(cd.bytes+ident,0,cd.size-ident)) return failure(EPERM,"unsupported CodeDirectory",reason);
