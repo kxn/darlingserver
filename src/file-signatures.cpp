@@ -60,21 +60,25 @@ bool softwareLeaf(X509* leaf) {
 }
 int verifyKnownAppleCriticalExtension(int ok,X509_STORE_CTX* ctx) {
     if(ok || X509_STORE_CTX_get_error(ctx)!=X509_V_ERR_UNHANDLED_CRITICAL_EXTENSION)return ok;
-    // OpenSSL does not know Apple's Developer ID Application certificate
-    // marker. Recognize exactly that leaf marker, whose value must be DER NULL;
-    // leave every other unknown critical extension as a verification failure.
+    // Developer ID Application certificates may also carry Apple's optional
+    // kernel-extension marker (TN2206). Both marker values must be DER NULL;
+    // require the Application marker and reject every other unknown critical
+    // extension. This does not authorize a kernel extension or platform image.
+    // https://developer.apple.com/library/archive/technotes/tn2206/
     if(X509_STORE_CTX_get_error_depth(ctx)!=0)return 0;
-    X509* cert=X509_STORE_CTX_get_current_cert(ctx);bool found=false;
+    X509* cert=X509_STORE_CTX_get_current_cert(ctx);unsigned recognized=0;
     for(int i=0;i<X509_get_ext_count(cert);++i) {
         X509_EXTENSION* ext=X509_get_ext(cert,i);
         if(!X509_EXTENSION_get_critical(ext) || X509_supported_extension(ext))continue;
         char oid[100]={};OBJ_obj2txt(oid,sizeof(oid),X509_EXTENSION_get_object(ext),1);
+        unsigned marker=!std::strcmp(oid,"1.2.840.113635.100.6.1.13")?1:
+                        !std::strcmp(oid,"1.2.840.113635.100.6.1.18")?2:0;
         const ASN1_OCTET_STRING* data=X509_EXTENSION_get_data(ext);
-        if(found || std::strcmp(oid,"1.2.840.113635.100.6.1.13") ||
-            ASN1_STRING_length(data)!=2 || std::memcmp(ASN1_STRING_get0_data(data),"\x05\x00",2))return 0;
-        found=true;
+        if(!marker || (recognized&marker) || ASN1_STRING_length(data)!=2 ||
+            std::memcmp(ASN1_STRING_get0_data(data),"\x05\x00",2))return 0;
+        recognized|=marker;
     }
-    if(!found || !codeSigningLeaf(cert))return 0;
+    if(!(recognized&1) || !codeSigningLeaf(cert))return 0;
     X509_STORE_CTX_set_error(ctx,X509_V_OK);return 1;
 }
 bool verifyCMS(const unsigned char* encoded,size_t size,const unsigned char* directory,size_t directorySize,bool platformOnly) {
