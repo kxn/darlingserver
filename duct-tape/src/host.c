@@ -29,6 +29,71 @@ long sysconf(int name);
 #define _SC_NPROCESSORS_CONF 83
 #define _SC_NPROCESSORS_ONLN 84
 
+// Native Linux libc, as in memory.c. Do not include Linux headers alongside XNU.
+int open(const char* path, int flags, ...);
+long read(int fd, void* buffer, unsigned long size);
+int close(int fd);
+int* __errno_location(void);
+#define LINUX_O_CLOEXEC 0x80000
+#define LINUX_EINTR 4
+
+static bool meminfo_pages(const char* text, const char* key, natural_t* pages) {
+	size_t length = strlen(key);
+	for (const char* line = text; line && *line; line = strchr(line, '\n')) {
+		if (*line == '\n') ++line;
+		if (strncmp(line, key, length) || line[length] != ':') continue;
+		const char* value = line + length + 1;
+		while (*value == ' ' || *value == '\t') ++value;
+		if (*value < '0' || *value > '9') return false;
+		uint64_t kib = 0;
+		do {
+			unsigned digit = *value++ - '0';
+			if (kib > (UINT64_MAX - digit) / 10) return false;
+			kib = kib * 10 + digit;
+		} while (*value >= '0' && *value <= '9');
+		while (*value == ' ' || *value == '\t') ++value;
+		if (strncmp(value, "kB", 2)) return false;
+		value += 2;
+		while (*value == ' ' || *value == '\t') ++value;
+		if ((*value && *value != '\n') || kib > UINT64_MAX / 1024) return false;
+		*pages = VM_STATISTICS_TRUNCATE_TO_32_BIT(kib * 1024 / PAGE_SIZE);
+		return true;
+	}
+	return false;
+}
+
+static kern_return_t linux_vm_stats(vm_statistics64_t stat) {
+	char text[16384];
+	unsigned long used = 0;
+	int fd = open("/proc/meminfo", LINUX_O_CLOEXEC);
+	if (fd < 0) return KERN_FAILURE;
+	for (;;) {
+		long size = read(fd, text + used, sizeof(text) - 1 - used);
+		if (size < 0 && *__errno_location() == LINUX_EINTR) continue;
+		if (size <= 0) {
+			close(fd);
+			if (size < 0) return KERN_FAILURE;
+			break;
+		}
+		used += size;
+		if (used == sizeof(text) - 1) {
+			close(fd);
+			return KERN_FAILURE; // Do not silently accept a truncated snapshot.
+		}
+	}
+	text[used] = '\0';
+	memset(stat, 0, sizeof(*stat));
+	// Translate measured Linux page states, not MemAvailable or Committed_AS.
+	// Unevictable is the userspace subset of wired memory; Linux has no exact
+	// Darwin wired/compressor/purgeable/event-counter equivalent. Those other
+	// counters remain unavailable (zero), rather than inventing measurements.
+	if (!meminfo_pages(text, "MemFree", &stat->free_count) ||
+	    !meminfo_pages(text, "Active", &stat->active_count) ||
+	    !meminfo_pages(text, "Inactive", &stat->inactive_count) ||
+	    !meminfo_pages(text, "Unevictable", &stat->wire_count)) return KERN_FAILURE;
+	return KERN_SUCCESS;
+}
+
 static void cache_sysinfo(void* context) {
 	struct sysinfo* cached_sysinfo = context;
 
@@ -206,18 +271,22 @@ kern_return_t host_virtual_physical_table_info(host_t host, hash_info_bucket_arr
 };
 
 kern_return_t host_statistics(host_t host, host_flavor_t flavor, host_info_t info, mach_msg_type_number_t* count) {
+	if (host == HOST_NULL) return KERN_INVALID_HOST;
 	switch (flavor) {
-		// we can get away with not implementing it
 		case HOST_VM_INFO: {
-			vm_statistics_t stat32 = (vm_statistics_t)info;
-
-			if (*count < HOST_VM_INFO_REV0_COUNT) {
-				return KERN_FAILURE;
-			}
-
-			dtape_stub_safe("HOST_VM_INFO");
-			memset(stat32, 0, (*count) * sizeof(integer_t));
-
+			if (*count < HOST_VM_INFO_REV0_COUNT) return KERN_FAILURE;
+			vm_statistics64_data_t measured;
+			kern_return_t result = linux_vm_stats(&measured);
+			if (result != KERN_SUCCESS) return result;
+			vm_statistics_data_t stat = {0};
+			stat.free_count = measured.free_count;
+			stat.active_count = measured.active_count;
+			stat.inactive_count = measured.inactive_count;
+			stat.wire_count = measured.wire_count;
+			// Match the revision/count negotiation in paired XNU kern/host.c.
+			*count = *count >= HOST_VM_INFO_REV2_COUNT ? HOST_VM_INFO_REV2_COUNT :
+			         *count >= HOST_VM_INFO_REV1_COUNT ? HOST_VM_INFO_REV1_COUNT : HOST_VM_INFO_REV0_COUNT;
+			memcpy(info, &stat, *count * sizeof(integer_t));
 			return KERN_SUCCESS;
 		}
 
@@ -231,16 +300,12 @@ kern_return_t host_statistics(host_t host, host_flavor_t flavor, host_info_t inf
 };
 
 kern_return_t vm_stats(void* info, unsigned int* count) {
-	vm_statistics64_t stat = (vm_statistics64_t)info;
-
-	if (*count < HOST_VM_INFO64_COUNT)
-		return (KERN_FAILURE);
-
-	memset(stat, 0, sizeof(*stat));
-
-	dtape_stub("TODO: actually fill in the values with something useful");
-
-	*count = HOST_VM_INFO64_COUNT;
-
+	if (*count < HOST_VM_INFO64_REV0_COUNT) return KERN_FAILURE;
+	vm_statistics64_data_t stat;
+	kern_return_t result = linux_vm_stats(&stat);
+	if (result != KERN_SUCCESS) return result;
+	// Keep XNU's historical revision support and write only the returned count.
+	*count = *count >= HOST_VM_INFO64_REV1_COUNT ? HOST_VM_INFO64_REV1_COUNT : HOST_VM_INFO64_REV0_COUNT;
+	memcpy(info, &stat, *count * sizeof(integer_t));
 	return KERN_SUCCESS;
 };
