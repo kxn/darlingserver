@@ -1151,6 +1151,7 @@ typedef struct dtape_remap_piece {
 
 static kern_return_t mach_vm_remap_external_shared(vm_map_t target_map, mach_vm_offset_t* address, mach_vm_size_t size, mach_vm_offset_t mask, int flags, vm_map_t src_map, mach_vm_offset_t memory_address, vm_prot_t* cur_protection, vm_prot_t* max_protection, vm_inherit_t inheritance) {
 	kern_return_t kr = KERN_SUCCESS;
+	const char* failure = "unspecified";
 	uint64_t page_size = sysconf(_SC_PAGESIZE);
 	uint64_t page_mask = page_size - 1;
 	uint64_t start = memory_address & ~page_mask;
@@ -1181,12 +1182,17 @@ static kern_return_t mach_vm_remap_external_shared(vm_map_t target_map, mach_vm_
 		return KERN_INVALID_ARGUMENT;
 
 	kr = dtape_map_sync_shared_entries(src_map);
-	if (kr != KERN_SUCCESS) return kr;
+	if (kr != KERN_SUCCESS) {
+		dtape_log_error("shared remap synchronization failed: kr=%d source=0x%llx size=0x%llx flags=0x%x",
+			kr, (unsigned long long)memory_address, (unsigned long long)size, flags);
+		return kr;
+	}
 	dtape_mutex_lock(&src_map->shared_entry_lock);
 	source_locked = true;
 	uint64_t cursor = start;
 	while (cursor < start + length) {
 		dtape_memory_region_info_t region;
+		failure = "source-region";
 		if (!dtape_hooks->task_get_memory_region_info(src_map->dtape_task->context, cursor, &region)
 				|| region.start_address > cursor || !region.page_count
 				|| region.page_count > (UINT64_MAX - region.start_address) / page_size) {
@@ -1214,6 +1220,7 @@ static kern_return_t mach_vm_remap_external_shared(vm_map_t target_map, mach_vm_
 		common_protection &= piece->protection;
 
 		if (reuse) {
+			failure = "existing-backing-bounds";
 			piece->page_offset = existing[0]->page_offset + (cursor - existing[0]->address) / page_size;
 			piece->descriptor = existing[0]->descriptor;
 			dtape_map_shared_descriptor_retain(piece->descriptor);
@@ -1225,7 +1232,8 @@ static kern_return_t mach_vm_remap_external_shared(vm_map_t target_map, mach_vm_
 		} else {
 			/* Importing an untracked shared file needs its original backing;
 			 * replacing it with a copy would silently disconnect its peers. */
-			if (region.shared) { kr = KERN_NOT_SUPPORTED; goto out; }
+			if (region.shared) { failure = "untracked-shared-source"; kr = KERN_NOT_SUPPORTED; goto out; }
+			failure = "backing-allocation";
 			int fd = memfd_create("darling-remapped", MFD_CLOEXEC);
 			if (fd < 0) { kr = KERN_RESOURCE_SHORTAGE; goto out; }
 			if (ftruncate(fd, piece->size)) { close(fd); kr = KERN_RESOURCE_SHORTAGE; goto out; }
@@ -1233,6 +1241,7 @@ static kern_return_t mach_vm_remap_external_shared(vm_map_t target_map, mach_vm_
 			if (!piece->descriptor) { close(fd); kr = KERN_RESOURCE_SHORTAGE; goto out; }
 			void* buffer = mmap(NULL, piece->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 			if (buffer == MAP_FAILED) { kr = KERN_RESOURCE_SHORTAGE; goto out; }
+			failure = "source-read";
 			kr = copyinmap(src_map, cursor, buffer, piece->size);
 			munmap(buffer, piece->size);
 			if (kr != KERN_SUCCESS) goto out;
@@ -1241,6 +1250,7 @@ static kern_return_t mach_vm_remap_external_shared(vm_map_t target_map, mach_vm_
 			/* Private-page conversion retains the preexisting copy/replace
 			 * race with concurrent writers. Already shared pages never pass
 			 * through that conversion and keep all existing aliases. */
+			failure = "source-backing-map";
 			if (dtape_hooks->task_map_file(src_map->dtape_task->context, fd, piece->size / page_size,
 					piece->protection, cursor, 0, dtape_memory_flag_fixed | dtape_memory_flag_overwrite) != cursor) {
 				dtape_map_shared_entry_destroy(entry);
@@ -1249,6 +1259,7 @@ static kern_return_t mach_vm_remap_external_shared(vm_map_t target_map, mach_vm_
 			}
 			dtape_map_insert_shared_entry_locked(src_map, entry);
 		}
+		failure = "target-entry-allocation";
 		piece->target_entry = dtape_map_shared_entry_create(0, piece->size, piece->page_offset, piece->descriptor);
 		if (!piece->target_entry) { kr = KERN_RESOURCE_SHORTAGE; goto out; }
 		cursor = end;
@@ -1258,11 +1269,13 @@ static kern_return_t mach_vm_remap_external_shared(vm_map_t target_map, mach_vm_
 
 	/* Reserve the whole target first. Each fixed mapping below replaces only
 	 * pages owned by this reservation, never an unrelated adjacent mapping. */
+	failure = "target-reservation";
 	target = dtape_hooks->task_allocate_pages(target_map->dtape_task->context, length / page_size,
 			0, 0, dtape_memory_flag_none);
 	if (!target) { kr = KERN_RESOURCE_SHORTAGE; goto out; }
 	for (dtape_remap_piece_t* piece = pieces; piece; piece = piece->next) {
 		uintptr_t destination = target + piece->address - start;
+		failure = "target-backing-map";
 		if (dtape_hooks->task_map_file(target_map->dtape_task->context, piece->descriptor->memfd,
 				piece->size / page_size, piece->protection, destination, piece->page_offset,
 				dtape_memory_flag_fixed | dtape_memory_flag_overwrite) != destination) {
@@ -1282,6 +1295,10 @@ static kern_return_t mach_vm_remap_external_shared(vm_map_t target_map, mach_vm_
 	*max_protection = VM_PROT_ALL;
 
 out:
+	if (kr != KERN_SUCCESS)
+		dtape_log_error("shared remap failed: phase=%s kr=%d source=0x%llx size=0x%llx cursor=0x%llx flags=0x%x",
+			failure, kr, (unsigned long long)memory_address, (unsigned long long)size,
+			(unsigned long long)cursor, flags);
 	if (source_locked) dtape_mutex_unlock(&src_map->shared_entry_lock);
 	if (kr != KERN_SUCCESS && target)
 		dtape_hooks->task_free_pages(target_map->dtape_task->context, target, length / page_size);

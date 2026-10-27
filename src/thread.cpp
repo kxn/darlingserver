@@ -1168,6 +1168,7 @@ uintptr_t DarlingServer::Thread::_mmap(uintptr_t address, size_t length, int pro
 	auto maybeReplyMessage = _s2cPerform(std::move(callMessage), dserver_s2c_msgnum_mmap, sizeof(dserver_s2c_reply_mmap_t));
 	if (!maybeReplyMessage) {
 		s2cLog.debug() << "_mmap call interrupted" << s2cLog.endLog;
+		s2cLog.error() << *this << ": mmap interrupted: address=" << address << ", length=" << length << ", protection=" << protection << ", flags=" << flags << ", fd=" << fd << ", offset=" << offset << s2cLog.endLog;
 		outErrno = EINTR;
 		return (uintptr_t)MAP_FAILED;
 	}
@@ -1178,6 +1179,9 @@ uintptr_t DarlingServer::Thread::_mmap(uintptr_t address, size_t length, int pro
 	s2cLog.debug() << "_mmap returned address=" << reply->address << ", errno_result=" << reply->errno_result << s2cLog.endLog;
 
 	outErrno = reply->errno_result;
+	if (reply->address == (uintptr_t)MAP_FAILED) {
+		s2cLog.error() << *this << ": mmap failed: errno=" << outErrno << ", address=" << address << ", length=" << length << ", protection=" << protection << ", flags=" << flags << ", fd=" << fd << ", offset=" << offset << s2cLog.endLog;
+	}
 	return reply->address;
 };
 
