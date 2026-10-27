@@ -528,6 +528,14 @@ void DarlingServer::Kqchan::Process::_modify(uint32_t flags) {
 	std::unique_lock lock(_mutex);
 
 	_flags = flags;
+	{
+		// The client drains earlier notifications while awaiting this ack.
+		// Re-arm notification delivery without discarding queued events or
+		// NOTE_TRACK child subscriptions, and send new notifications after ack.
+		std::unique_lock notificationLock(_notificationMutex);
+		_canSendNotification = true;
+		_deferNotification = true;
+	}
 
 	Message msg(sizeof(dserver_kqchan_reply_proc_modify_t), 0, _checkForEventsAsyncFactory());
 
@@ -540,6 +548,7 @@ void DarlingServer::Kqchan::Process::_modify(uint32_t flags) {
 
 	lock.unlock(); // the outbox has its own lock
 	_outbox.push(std::move(msg));
+	_sendDeferredNotification();
 };
 
 void DarlingServer::Kqchan::Process::_read() {
