@@ -1229,6 +1229,11 @@ kern_return_t thread_depress_abort_from_user(thread_t thread) {
 };
 
 kern_return_t thread_info(thread_t xthread, thread_flavor_t flavor, thread_info_t thread_info_out, mach_msg_type_number_t* thread_info_count) {
+	/* MIG conversion can reject a non-thread port and pass THREAD_NULL.
+	 * Return the normal Mach argument error before touching its lock. */
+	if (xthread == THREAD_NULL || !thread_info_out || !thread_info_count) {
+		return KERN_INVALID_ARGUMENT;
+	}
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
 
 	switch (flavor) {
