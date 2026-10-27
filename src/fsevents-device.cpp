@@ -91,6 +91,17 @@ struct Device : std::enable_shared_from_this<Device> {
         return type<int(actions.size()) && actions[type]==1 && (!filtered || !filter.count(dev));
     }
     void loss() { lost=true; }
+    bool internalJournalFile(const std::string& host) const {
+        /* The shared journal's own atomic ID persistence must not feed back
+         * into CoreServices' raw file-ID watcher. Match only the reserved
+         * prefix-root files, preserving equal user names in other scopes. */
+        for (const auto& root:roots) {
+            if (root.guest!="/") continue;
+            const auto state=root.host+"/.darling-fsevents-id";
+            if (host==state || host==state+".pending" || host==state+".lock") return true;
+        }
+        return false;
+    }
     void path(std::vector<uint8_t>& bytes,const Entry& entry,bool packed) {
         if (entry.guest.size()+1>UINT16_MAX) { loss();return; }
         append(bytes,String);append(bytes,uint16_t(entry.guest.size()+1));
@@ -118,6 +129,7 @@ struct Device : std::enable_shared_from_this<Device> {
         append(bytes,Done);queue.push_back(std::move(bytes));
     }
     int inventory(const std::string& host,const std::string& guest,bool initial) {
+        if (internalJournalFile(host)) return 0;
         Entry entry{host,guest,{}};
         if (!infoFor(host,entry.info)) { int error=errno;fprintf(stderr,"fsevents inventory lstat: %s: %s\n",host.c_str(),strerror(error));return -error; }
         if (entries.size()>=MaxEntries) return -ENOSPC;
@@ -189,6 +201,7 @@ struct Device : std::enable_shared_from_this<Device> {
         if (event.mask&IN_UNMOUNT) { loss();return; }
         if (!event.len) return; // parent watch supplies paired directory moves/deletes
         auto host=watch->second.host+"/"+event.name;
+        if (internalJournalFile(host)) return;
         auto guest=watch->second.guest+(watch->second.guest=="/"?"":"/")+event.name;
         auto found=entries.find(host);
         if (event.mask&(IN_DELETE|IN_MOVED_FROM)) {
