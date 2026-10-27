@@ -509,6 +509,13 @@ static void thread_continuation_callback(void* context) {
 	wait_result_t wait_result;
 
 	thread_lock(&thread->xnu_thread);
+	// A queued microthread resume is not necessarily an XNU wake. Keep
+	// the continuation until thread_unblock() makes the wait runnable.
+	while (thread->xnu_thread.state & TH_WAIT) {
+		thread_unlock(&thread->xnu_thread);
+		dtape_hooks->thread_suspend(thread->context, thread_continuation_callback, thread, NULL);
+		thread_lock(&thread->xnu_thread);
+	}
 	continuation = thread->xnu_thread.continuation;
 	thread->xnu_thread.continuation = NULL;
 
@@ -535,8 +542,11 @@ wait_result_t thread_block_parameter(thread_continue_t continuation, void* param
 
 	thread_unlock(&thread->xnu_thread);
 
-	if (waiting) {
+	while (waiting) {
 		dtape_hooks->thread_suspend(thread->context, continuation ? thread_continuation_callback : NULL, thread, NULL);
+		thread_lock(&thread->xnu_thread);
+		waiting = thread->xnu_thread.state & TH_WAIT;
+		thread_unlock(&thread->xnu_thread);
 	}
 
 	thread_lock(&thread->xnu_thread);
