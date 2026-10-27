@@ -166,10 +166,13 @@ void dtape_thread_destroy(dtape_thread_t* thread) {
 };
 
 void dtape_thread_entering(dtape_thread_t* thread) {
-	// if the thread is entering, it cannot be waiting
-	thread->xnu_thread.state &= ~(TH_WAIT | TH_UNINT);
+	// An internal mutex can suspend and resume the microthread after
+	// assert_wait(), before thread_block(). That resume does not satisfy
+	// the armed XNU wait. Only thread_unblock() clears its waiting state.
 	thread->xnu_thread.state |= TH_RUN;
-	thread->xnu_thread.block_hint = kThreadWaitNone;
+	if (!(thread->xnu_thread.state & TH_WAIT)) {
+		thread->xnu_thread.block_hint = kThreadWaitNone;
+	}
 };
 
 void dtape_thread_exiting(dtape_thread_t* thread) {
@@ -568,6 +571,12 @@ boolean_t thread_unblock(thread_t xthread, wait_result_t wresult) {
 		}
 		xthread->wait_timer_is_set = FALSE;
 	}
+
+	// Match XNU sched_prim.c thread_unblock(): update the wait state at
+	// the actual wake, including a wake before thread_block() is reached.
+	xthread->state = (xthread->state | TH_RUN) &
+		~(TH_WAIT | TH_UNINT | TH_WAIT_REPORT);
+	xthread->block_hint = kThreadWaitNone;
 
 	dtape_hooks->thread_resume(thread->context);
 	return TRUE;
