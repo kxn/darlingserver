@@ -502,6 +502,14 @@ void thread_deallocate_safe(thread_t thread) {
 	return thread_deallocate(thread);
 };
 
+static libsimple_lock_t* thread_unlock_for_suspend(dtape_thread_t* thread) {
+	// thread_lock is a cooperative mutex. Release its ownership while
+	// retaining the queue interlock until the existing suspend hook finishes
+	// the context handoff. A waker cannot pass thread_lock before that point.
+	return dtape_mutex_unlock_for_suspend(
+		&thread->xnu_thread.sched_lock.dtape_interlock.dtape_interlock.dtape_mutex);
+};
+
 static void thread_continuation_callback(void* context) {
 	dtape_thread_t* thread = context;
 	thread_continue_t continuation;
@@ -512,8 +520,8 @@ static void thread_continuation_callback(void* context) {
 	// A queued microthread resume is not necessarily an XNU wake. Keep
 	// the continuation until thread_unblock() makes the wait runnable.
 	while (thread->xnu_thread.state & TH_WAIT) {
-		thread_unlock(&thread->xnu_thread);
-		dtape_hooks->thread_suspend(thread->context, thread_continuation_callback, thread, NULL);
+		libsimple_lock_t* unlockMe = thread_unlock_for_suspend(thread);
+		dtape_hooks->thread_suspend(thread->context, thread_continuation_callback, thread, unlockMe);
 		thread_lock(&thread->xnu_thread);
 	}
 	continuation = thread->xnu_thread.continuation;
@@ -538,18 +546,12 @@ wait_result_t thread_block_parameter(thread_continue_t continuation, void* param
 	thread->xnu_thread.continuation = continuation;
 	thread->xnu_thread.parameter = parameter;
 
-	bool waiting = thread->xnu_thread.state & TH_WAIT;
-
-	thread_unlock(&thread->xnu_thread);
-
-	while (waiting) {
-		dtape_hooks->thread_suspend(thread->context, continuation ? thread_continuation_callback : NULL, thread, NULL);
+	while (thread->xnu_thread.state & TH_WAIT) {
+		libsimple_lock_t* unlockMe = thread_unlock_for_suspend(thread);
+		dtape_hooks->thread_suspend(thread->context, continuation ? thread_continuation_callback : NULL, thread, unlockMe);
 		thread_lock(&thread->xnu_thread);
-		waiting = thread->xnu_thread.state & TH_WAIT;
-		thread_unlock(&thread->xnu_thread);
 	}
 
-	thread_lock(&thread->xnu_thread);
 	wait_result_t wait_result = thread->xnu_thread.wait_result;
 	thread_unlock(&thread->xnu_thread);
 

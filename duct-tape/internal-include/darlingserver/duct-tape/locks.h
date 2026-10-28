@@ -29,6 +29,10 @@ typedef struct lck_spin {
 void dtape_mutex_init(dtape_mutex_t* mutex);
 void dtape_mutex_lock(dtape_mutex_t* mutex);
 void dtape_mutex_unlock(dtape_mutex_t* mutex);
+// Release ownership and wake a waiter, but retain the queue lock until the
+// current microthread is suspended. Pass the result to thread_suspend's
+// unlockMe argument; never abandon the returned lock while still running.
+libsimple_lock_t* dtape_mutex_unlock_for_suspend(dtape_mutex_t* mutex);
 bool dtape_mutex_try_lock(dtape_mutex_t* mutex);
 void dtape_mutex_assert(dtape_mutex_t* mutex, bool should_be_owned);
 

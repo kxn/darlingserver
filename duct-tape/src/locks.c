@@ -123,14 +123,14 @@ bool dtape_mutex_try_lock(dtape_mutex_t* mutex) {
 	return FALSE;
 };
 
-void dtape_mutex_unlock(dtape_mutex_t* mutex) {
+libsimple_lock_t* dtape_mutex_unlock_for_suspend(dtape_mutex_t* mutex) {
 	thread_t xcurr_thread = current_thread();
 	dtape_thread_t* curr_thread = dtape_thread_for_xnu_thread(xcurr_thread);
 
 	if (!curr_thread) {
 		dtape_log_warning("Trying to unlock mutex without an active thread!");
 		// see lck_mtx_lock()
-		return libsimple_lock_unlock(&mutex->dtape_queue_lock);
+		return &mutex->dtape_queue_lock;
 	}
 
 	dtape_mutex_assert(mutex, true);
@@ -153,9 +153,13 @@ void dtape_mutex_unlock(dtape_mutex_t* mutex) {
 	dtape_hooks->thread_resume(thread->context);
 
 out:
-	libsimple_lock_unlock(&mutex->dtape_queue_lock);
 	__atomic_thread_fence(__ATOMIC_RELEASE);
-	return;
+	return &mutex->dtape_queue_lock;
+};
+
+void dtape_mutex_unlock(dtape_mutex_t* mutex) {
+	libsimple_lock_unlock(dtape_mutex_unlock_for_suspend(mutex));
+	__atomic_thread_fence(__ATOMIC_RELEASE);
 };
 
 void lck_mtx_init(lck_mtx_t* lock, lck_grp_t* grp, lck_attr_t* attr) {
