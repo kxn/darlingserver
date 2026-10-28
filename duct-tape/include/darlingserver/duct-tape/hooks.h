@@ -41,6 +41,16 @@ typedef dtape_thread_t* (*dtape_hook_thread_lookup_f)(int id, bool id_is_nsid, b
 typedef dtape_thread_t* (*dtape_hook_thread_lookup_eternal_f)(dtape_eternal_id_t eid, bool retain);
 typedef dtape_thread_state_t (*dtape_hook_thread_get_state_f)(void* thread_context);
 typedef int (*dtape_hook_thread_send_signal_f)(void* thread_context, int signal);
+typedef enum dtape_debug_register_result {
+    dtape_debug_register_success,
+    dtape_debug_register_failure,
+    dtape_debug_register_invalid,
+    dtape_debug_register_denied,
+    dtape_debug_register_no_thread,
+    dtape_debug_register_unsupported,
+} dtape_debug_register_result_t;
+typedef dtape_debug_register_result_t (*dtape_hook_thread_debug_registers_f)(void* thread_context, uint64_t registers[8], bool write);
+
 typedef void (*dtape_hook_thread_context_dispose_f)(void* thread_context);
 typedef dtape_eternal_id_t (*dtape_hook_thread_eternal_id_f)(void* thread_context);
 
@@ -127,6 +137,7 @@ typedef struct dtape_hooks {
 	dtape_hook_task_clear_port_set_f task_clear_port_set;
 #endif
 	dtape_hook_task_copy_memory_regions_f task_copy_memory_regions;
+	dtape_hook_thread_debug_registers_f thread_debug_registers;
 } dtape_hooks_t;
 
 #ifdef __cplusplus

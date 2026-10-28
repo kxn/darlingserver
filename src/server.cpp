@@ -40,6 +40,7 @@
 #include <sys/wait.h>
 
 #include <darlingserver/logging.hpp>
+#include <darlingserver/linux-debug-registers.hpp>
 
 static DarlingServer::Server* sharedInstancePointer = nullptr;
 
@@ -200,6 +201,23 @@ struct DTapeHooks {
 	static dtape_thread_state_t dtape_hook_thread_get_state(void* thread_context) {
 		return static_cast<dtape_thread_state_t>(static_cast<DarlingServer::Thread*>(thread_context)->getRunState());
 	};
+
+	static dtape_debug_register_result_t dtape_hook_thread_debug_registers(void* context, uint64_t registers[8], bool write) {
+        auto thread = static_cast<DarlingServer::Thread*>(context);
+        if (!thread || thread->isDead()) return dtape_debug_register_no_thread;
+        auto process = thread->process();
+        if (!process) return dtape_debug_register_no_thread;
+        int error = DarlingServer::accessLinuxDebugRegisters(process->id(), thread->id(), registers, write);
+        switch (error) {
+            case 0: return dtape_debug_register_success;
+            case ESRCH: case ENOENT: return dtape_debug_register_no_thread;
+            case EPERM: case EACCES: return dtape_debug_register_denied;
+            case EINVAL: return dtape_debug_register_invalid;
+            case EIO: return write ? dtape_debug_register_invalid : dtape_debug_register_failure;
+            case ENOTSUP: return dtape_debug_register_unsupported;
+            default: return dtape_debug_register_failure;
+        }
+    };
 
 	static int dtape_hook_thread_send_signal(void* thread_context, int signal) {
 		try {
@@ -474,6 +492,7 @@ struct DTapeHooks {
 		.task_clear_port_set = dtape_hook_task_clear_port_set,
 #endif
 		.task_copy_memory_regions = dtape_hook_task_copy_memory_regions,
+		.thread_debug_registers = dtape_hook_thread_debug_registers,
 	};
 };
 
