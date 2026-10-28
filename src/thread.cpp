@@ -1070,10 +1070,17 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 	Server::sharedInstance().sendMessage(std::move(call));
 
 	// now let's wait for the reply
-	if (!dtape_semaphore_down_simple(_s2cReplySempahore)) {
-		// got interrupted while waiting
-		dtape_semaphore_up(_s2cPerformSempahore);
-		return std::nullopt;
+	while (!dtape_semaphore_down_simple(_s2cReplySempahore)) {
+		// The request is already on the wire. A signal interrupts the caller's
+		// wait, not the client's operation; keep the perform gate until its
+		// reply has been consumed. Otherwise the next operation can mistake
+		// this reply for its own (the S2C protocol has no transaction IDs).
+		std::shared_lock lock(_rwlock);
+		if (_dead || _terminating) {
+			lock.unlock();
+			dtape_semaphore_up(_s2cPerformSempahore);
+			return std::nullopt;
+		}
 	}
 
 	s2cLog.debug() << *this << ": Received S2C reply" << s2cLog.endLog;
