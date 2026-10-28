@@ -81,13 +81,22 @@ int verifyKnownAppleCriticalExtension(int ok,X509_STORE_CTX* ctx) {
     if(!(recognized&1) || !codeSigningLeaf(cert))return 0;
     X509_STORE_CTX_set_error(ctx,X509_V_OK);return 1;
 }
-bool verifyCMS(const unsigned char* encoded,size_t size,const unsigned char* directory,size_t directorySize,bool platformOnly) {
+bool verifyCMS(const unsigned char* encoded,size_t size,const unsigned char* directory,size_t directorySize,bool platformOnly,bool metadataOnly=false) {
     if (size>LONG_MAX || directorySize>INT_MAX) return false;
     const unsigned char* cursor=encoded;
     std::unique_ptr<CMS_ContentInfo,decltype(&CMS_ContentInfo_free)> cms(d2i_CMS_ContentInfo(nullptr,&cursor,size),CMS_ContentInfo_free);
     if (!cms || cursor!=encoded+size || OBJ_obj2nid(CMS_get0_type(cms.get()))!=NID_pkcs7_signed) return false;
     auto* signers=CMS_get0_SignerInfos(cms.get());if (!signers || sk_CMS_SignerInfo_num(signers)!=1) return false;
     auto content=CMS_get0_content(cms.get());if (!content || *content) return false;
+    if (metadataOnly) {
+        // csops reads authenticated file metadata; certificate trust is a
+        // separate Security decision. Verify the detached signature, without
+        // assigning Apple identity or rejecting a local self-signed identity.
+        std::unique_ptr<BIO,decltype(&BIO_free)> data(BIO_new_mem_buf(directory,directorySize),BIO_free);
+        std::unique_ptr<BIO,decltype(&BIO_free)> sink(BIO_new(BIO_s_null()),BIO_free);
+        return data && sink && CMS_verify(cms.get(),nullptr,nullptr,data.get(),sink.get(),
+            CMS_BINARY|CMS_NO_SIGNER_CERT_VERIFY)==1;
+    }
     std::unique_ptr<X509_STORE,decltype(&X509_STORE_free)> store(X509_STORE_new(),X509_STORE_free);
     std::unique_ptr<BIO,decltype(&BIO_free)> roots(BIO_new_mem_buf(appleCodeSigningRoots,sizeof(appleCodeSigningRoots)-1),BIO_free);
     if (!store || !roots) return false;
@@ -128,7 +137,7 @@ struct Registered {
 std::mutex registrationLock;
 std::vector<std::unique_ptr<Registered>> registrations;
 int failure(int error,const char* text,std::string* reason) { if(reason)*reason=text;return error; }
-int verify(int fd,uint64_t slice,uint64_t signatureOffset,uint64_t signatureSize,uint64_t& covered,std::string* reason,bool platformOnly) {
+int verify(int fd,uint64_t slice,uint64_t signatureOffset,uint64_t signatureSize,uint64_t& covered,std::string* reason,bool platformOnly,ExecutableMetadata* metadata=nullptr) {
     covered=0;struct stat before{};
     if (fstat(fd,&before)) return failure(errno,"descriptor stat failed",reason);
     if (!S_ISREG(before.st_mode)) return failure(EBADF,"descriptor is not a regular file",reason);
@@ -196,7 +205,7 @@ int verify(int fd,uint64_t slice,uint64_t signatureOffset,uint64_t signatureSize
         return failure(EINVAL,"CodeDirectory coverage bounds",reason);
     // Verify the detached CMS and Apple Software Signing policy before trusting
     // any coverage result or installing an entry in the registration table.
-    if (!adHoc && !verifyCMS(cmsEntry->second.bytes+8,cmsEntry->second.size-8,cd.bytes,cd.size,platformOnly))
+    if (!adHoc && !verifyCMS(cmsEntry->second.bytes+8,cmsEntry->second.size-8,cd.bytes,cd.size,platformOnly,metadata!=nullptr))
         return failure(EPERM,platformOnly?"Apple Software Signing CMS validation failed":"Apple-rooted code-signing CMS validation failed",reason);
     std::vector<unsigned char> page(pageSize);std::array<unsigned char,EVP_MAX_MD_SIZE> hash{};unsigned digestSize=0;
     for (uint32_t i=0;i<slots;++i) {
@@ -205,6 +214,9 @@ int verify(int fd,uint64_t slice,uint64_t signatureOffset,uint64_t signatureSize
             EVP_Digest(page.data(),size,hash.data(),&digestSize,digest,nullptr)!=1 ||
             CRYPTO_memcmp(hash.data(),cd.bytes+hashOffset+uint64_t(i)*hashSize,hashSize)) return failure(EPERM,"signed code page mismatch",reason);
     }
+    if (metadata) for (uint32_t slot:{5U,7U})
+        if (blobs.count(slot) && slot>special)
+            return failure(EPERM,"entitlement blob is not signed by CodeDirectory",reason);
     for (uint32_t slot:{2U,5U,7U}) if (slot<=special) {
         const unsigned char* expected=cd.bytes+hashOffset-uint64_t(slot)*hashSize;bool nonzero=false;
         for(unsigned i=0;i<hashSize;++i)nonzero|=expected[i]!=0;
@@ -214,6 +226,33 @@ int verify(int fd,uint64_t slice,uint64_t signatureOffset,uint64_t signatureSize
             return failure(EPERM,"signed special slot mismatch",reason);
     }
     struct stat after{};if (fstat(fd,&after) || !sameFile(before,after)) return failure(EAGAIN,"file changed during verification",reason);
+    if (metadata) {
+        ExecutableMetadata result;result.valid=true;result.flags=flags;result.slice=slice;
+        result.identifier=reinterpret_cast<const char*>(cd.bytes+ident);
+        if (version>=0x20200) {
+            if(cd.size<52)return failure(EINVAL,"short team CodeDirectory",reason);
+            uint32_t team=be32(cd.bytes+48);
+            if(team) {
+                if(team<52 || team>=cd.size || !std::memchr(cd.bytes+team,0,cd.size-team))
+                    return failure(EINVAL,"invalid CodeDirectory team",reason);
+                result.team=reinterpret_cast<const char*>(cd.bytes+team);
+            }
+        }
+        result.directory.assign(cd.bytes,cd.bytes+cd.size);
+        result.blob.assign(signature.begin(),signature.begin()+length);
+        for(auto pair:{std::make_pair(5U,&result.xml),std::make_pair(7U,&result.der)}) {
+            auto blob=blobs.find(pair.first);if(blob==blobs.end())continue;
+            if(be32(blob->second.bytes)!=(pair.first==5?0xfade7171:0xfade7172))
+                return failure(EINVAL,"invalid entitlement blob magic",reason);
+            pair.second->assign(blob->second.bytes,blob->second.bytes+blob->second.size);
+        }
+        if(EVP_Digest(cd.bytes,cd.size,hash.data(),&digestSize,digest,nullptr)!=1 || digestSize<20)
+            return failure(EIO,"CodeDirectory digest failed",reason);
+        std::copy_n(hash.begin(),20,result.cdhash.begin());
+        *metadata=std::move(result);covered=limit;
+        if(reason)*reason="verified executable file metadata; no platform identity or enforcement";
+        return 0;
+    }
     auto registration=std::make_unique<Registered>();registration->fd=fcntl(fd,F_DUPFD_CLOEXEC,0);
     if(registration->fd<0)return failure(errno,"registration descriptor duplication failed",reason);
     registration->identity=after;registration->slice=slice;registration->covered=limit;registration->directory.assign(cd.bytes,cd.bytes+cd.size);
@@ -234,4 +273,60 @@ int registerEmbeddedFile(int fd,uint64_t slice,uint64_t start,uint64_t size,uint
     catch(const std::bad_alloc&) {covered=0;return failure(ENOMEM,"allocation failed",reason);}
     catch(...) {covered=0;return failure(EIO,"signature verification failed",reason);}
 }
+int executableMetadata(int fd,const std::vector<unsigned char>& live,ExecutableMetadata& result,std::string* reason) {
+    result={};
+    try {
+        struct stat before{};if(fstat(fd,&before))return failure(errno,"executable stat",reason);
+        if(!S_ISREG(before.st_mode) || before.st_size<32 || live.size()<32 || live.size()>32+16*1024*1024)
+            return failure(EINVAL,"executable header bounds",reason);
+        const auto* h=live.data();
+        if(le32(h)!=0xfeedfacf || le32(h+4)!=0x01000007 || le32(h+12)!=2 ||
+            le32(h+16)>16384 || le32(h+20)!=live.size()-32)
+            return failure(ENOEXEC,"expected loaded Intel executable",reason);
+        uint64_t total=before.st_size,slice=0,length=total;std::array<unsigned char,8> prefix{};
+        if(!readAt(fd,prefix.data(),prefix.size(),0,total))return failure(EIO,"executable header read",reason);
+        uint32_t fat=be32(prefix.data());
+        if(fat==0xcafebabe || fat==0xcafebabf) {
+            uint32_t count=be32(prefix.data()+4),stride=fat==0xcafebabe?20:32;bool found=false;
+            if(!count || count>4096 || uint64_t(count)*stride>total-8)
+                return failure(EINVAL,"FAT architecture bounds",reason);
+            for(uint32_t i=0;i<count;i++) {
+                std::array<unsigned char,32> arch{};
+                if(!readAt(fd,arch.data(),stride,8+uint64_t(i)*stride,total))return failure(EIO,"FAT architecture read",reason);
+                if(be32(arch.data())!=le32(h+4) || (be32(arch.data()+4)&0xffffff)!=(le32(h+8)&0xffffff))continue;
+                if(found)return failure(EINVAL,"ambiguous FAT architecture",reason);
+                found=true;slice=stride==20?be32(arch.data()+8):be64(arch.data()+8);
+                length=stride==20?be32(arch.data()+12):be64(arch.data()+16);
+                if(!range(slice,length,total))return failure(EINVAL,"FAT slice bounds",reason);
+            }
+            if(!found)return failure(ENOEXEC,"loaded FAT architecture not found",reason);
+        }
+        if(live.size()>length)return failure(EINVAL,"loaded header exceeds slice",reason);
+        std::vector<unsigned char> disk(live.size());
+        if(!readAt(fd,disk.data(),disk.size(),slice,total) || disk!=live)
+            return failure(EAGAIN,"loaded header does not match executable file",reason);
+        size_t at=32;uint32_t start=0,size=0;bool found=false;
+        for(uint32_t i=0;i<le32(h+16);i++) {
+            if(at>live.size() || live.size()-at<8)return failure(EINVAL,"loaded command truncated",reason);
+            uint32_t command=le32(h+at),bytes=le32(h+at+4);
+            if(bytes<8 || bytes>live.size()-at)return failure(EINVAL,"loaded command bounds",reason);
+            if(command==0x1d) {
+                if(found || bytes!=16)return failure(EINVAL,"duplicate signature command",reason);
+                found=true;start=le32(h+at+8);size=le32(h+at+12);
+            }
+            at+=bytes;
+        }
+        if(at!=live.size())return failure(EINVAL,"loaded commands length",reason);
+        if(found) {
+            if(start>length || size>length-start)return failure(EINVAL,"signature outside FAT slice",reason);
+            uint64_t covered=0;int error=verify(fd,slice,start,size,covered,reason,false,&result);
+            if(error)return error;
+        } else {result.slice=slice;if(reason)*reason="unsigned executable";}
+        struct stat after{};
+        if(fstat(fd,&after) || !sameFile(before,after)) {result={};return failure(EAGAIN,"executable changed",reason);}
+        return 0;
+    } catch(const std::bad_alloc&) {result={};return failure(ENOMEM,"allocation failed",reason);}
+      catch(...) {result={};return failure(EIO,"executable metadata failed",reason);}
+}
+
 }

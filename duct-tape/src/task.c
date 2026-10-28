@@ -220,6 +220,14 @@ void dtape_task_set_dyld_info(dtape_task_t* task, uint64_t address, uint64_t len
 	dtape_condvar_signal(&task->dyld_info_condvar, SIZE_MAX);
 };
 
+/* A non-waiting snapshot for metadata readers; the caller keeps task alive. */
+void dtape_task_get_dyld_info(dtape_task_t* task, uint64_t* address, uint64_t* length) {
+    dtape_mutex_lock(&task->dyld_info_lock);
+    *address = task->dyld_info_addr;
+    *length = task->dyld_info_length;
+    dtape_mutex_unlock(&task->dyld_info_lock);
+}
+
 void dtape_task_set_sigexc_enabled(dtape_task_t* task, bool enabled) {
 	// FIXME: we should probably have a lock for this
 	task->has_sigexc = enabled;

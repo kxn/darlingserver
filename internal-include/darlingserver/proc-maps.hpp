@@ -6,6 +6,10 @@
 #include <string_view>
 #include <sys/mman.h>
 #include <sys/sysmacros.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <fstream>
+#include <string>
 
 namespace DarlingServer::ProcMaps {
 struct Entry {
@@ -56,5 +60,53 @@ inline bool parse(std::string_view line, Entry& output) {
     output = entry;
     return true;
 }
+// Linux overlayfs may present one st_dev through fstat while the VMA uses its
+// real backing file's device. Obtain that relationship from the kernel itself:
+// mmap this very descriptor, retain the VMA, and compare its /proc identity to
+// the target VMA. Never infer equality from an inode or pathname alone.
+struct FileMappingProof {
+    Entry descriptorMapping{}, targetMapping{};
+    struct stat before{}, after{};
+    const char* stage = "initial";
+};
+inline bool sameFileSnapshot(const struct stat& a,const struct stat& b) {
+    return a.st_dev==b.st_dev && a.st_ino==b.st_ino && a.st_size==b.st_size &&
+        a.st_mtim.tv_sec==b.st_mtim.tv_sec && a.st_mtim.tv_nsec==b.st_mtim.tv_nsec &&
+        a.st_ctim.tv_sec==b.st_ctim.tv_sec && a.st_ctim.tv_nsec==b.st_ctim.tv_nsec;
+}
+inline bool mappingAt(pid_t pid,uint64_t address,Entry& output) {
+    std::ifstream maps("/proc/"+std::to_string(pid)+"/maps");std::string line;
+    while(std::getline(maps,line)) {
+        Entry entry;
+        if(parse(line,entry) && entry.start<=address && address<entry.end) {output=entry;return true;}
+    }
+    return false;
+}
+inline bool mappedFileMatches(int fd,pid_t pid,uint64_t address,uint64_t fileOffset,
+    const struct stat& verifiedFile,FileMappingProof& proof) {
+    proof={};proof.stage="descriptor-stat-before";
+    if(fstat(fd,&proof.before) || !S_ISREG(proof.before.st_mode) || !sameFileSnapshot(verifiedFile,proof.before))return false;
+    long pageSize=sysconf(_SC_PAGESIZE);proof.stage="page-size";if(pageSize<=0)return false;
+    proof.stage="descriptor-mmap";
+    void* mapping=mmap(nullptr,static_cast<size_t>(pageSize),PROT_READ,MAP_PRIVATE,fd,0);
+    if(mapping==MAP_FAILED)return false;
+    struct Mapping {void* address;size_t size;~Mapping(){munmap(address,size);}} hold{mapping,static_cast<size_t>(pageSize)};
+    uint64_t local=reinterpret_cast<uintptr_t>(mapping);
+    proof.stage="descriptor-vma";
+    if(!mappingAt(getpid(),local,proof.descriptorMapping) || !proof.descriptorMapping.inode ||
+        proof.descriptorMapping.offset>UINT64_MAX-(local-proof.descriptorMapping.start) ||
+        proof.descriptorMapping.offset+local-proof.descriptorMapping.start!=0)return false;
+    proof.stage="target-vma";
+    if(!mappingAt(pid,address,proof.targetMapping) || !proof.targetMapping.inode)return false;
+    const Entry& own=proof.descriptorMapping;const Entry& target=proof.targetMapping;
+    proof.stage="backing-device-inode-offset";
+    if(own.device!=target.device || own.inode!=target.inode ||
+        target.offset>UINT64_MAX-(address-target.start) ||
+        target.offset+address-target.start!=fileOffset)return false;
+    proof.stage="descriptor-stat-after";
+    if(fstat(fd,&proof.after) || !sameFileSnapshot(proof.before,proof.after))return false;
+    proof.stage="matched";return true;
+}
+
 }
 #endif

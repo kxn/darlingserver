@@ -21,6 +21,10 @@
 #include <darlingserver/call.hpp>
 #include <darlingserver/server.hpp>
 #include <sys/uio.h>
+#include <cstdio>
+#include <cstdarg>
+#include <sys/stat.h>
+#include <darlingserver/proc-maps.hpp>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -1011,6 +1015,156 @@ void DarlingServer::Call::InterruptExit::processCall() {
 		}
 	}
 };
+
+
+namespace {
+bool signatureTraceEnabled() {
+    auto enabled=[](const char* key){const char* v=getenv(key);return v && *v && std::strcmp(v,"0");};
+    return enabled("DARLING_OS_LOG_STDERR") || enabled("DARLING_TRACE_FILE_SIGNATURES");
+}
+void signatureTrace(const char* format,...) {
+    if(!signatureTraceEnabled())return;
+    char text[4096];va_list args;va_start(args,format);vsnprintf(text,sizeof(text),format,args);va_end(args);
+    // Use the existing whole-run stderr gate, without per-process logger setup.
+    std::fprintf(stderr,"[csops-metadata] %s\n",text);
+    callLog.error()<<"[csops-metadata] "<<text<<callLog.endLog;
+}
+bool signatureMemory(pid_t pid,bool write,uint64_t address,void* bytes,size_t length) {
+    if(!address || address>UINT64_MAX-length)return false;
+    struct iovec local{bytes,length},remote{reinterpret_cast<void*>(address),length};
+    auto transfer=write?process_vm_writev:process_vm_readv;
+    ssize_t result;
+    do {result=transfer(pid,&local,1,&remote,1,0);}while(result<0 && errno==EINTR);
+    bool valid=result>=0 && static_cast<size_t>(result)==length;
+    if(!valid)signatureTrace("stage=memory-transfer pid=%d write=%d address=0x%llx length=%zu actual=%lld errno=%d",
+        pid,write,(unsigned long long)address,length,(long long)result,result<0?errno:0);
+    return valid;
+}
+uint32_t signatureLE32(const unsigned char* p) {
+    return uint32_t(p[0])|uint32_t(p[1])<<8|uint32_t(p[2])<<16|uint32_t(p[3])<<24;
+}
+void signatureBE32(unsigned char* p,uint32_t value) {
+    p[0]=value>>24;p[1]=value>>16;p[2]=value>>8;p[3]=value;
+}
+bool signatureMapping(int fd,pid_t pid,uint64_t header,uint64_t slice,const struct stat& file) {
+    DarlingServer::ProcMaps::FileMappingProof proof;
+    bool matched=DarlingServer::ProcMaps::mappedFileMatches(fd,pid,header,slice,file,proof);
+    signatureTrace("stage=mapping-proof pid=%d header=0x%llx slice=0x%llx presented-dev=0x%llx presented-ino=%llu fd-vma-dev=0x%llx fd-vma-ino=%llu peer-dev=0x%llx peer-ino=%llu peer-start=0x%llx peer-offset=0x%llx proof-stage=%s matched=%d",
+        pid,(unsigned long long)header,(unsigned long long)slice,(unsigned long long)file.st_dev,
+        (unsigned long long)file.st_ino,(unsigned long long)proof.descriptorMapping.device,
+        (unsigned long long)proof.descriptorMapping.inode,(unsigned long long)proof.targetMapping.device,
+        (unsigned long long)proof.targetMapping.inode,(unsigned long long)proof.targetMapping.start,
+        (unsigned long long)proof.targetMapping.offset,proof.stage,matched);
+    return matched;
+}
+}
+
+void DarlingServer::Call::Csops::processCall() {
+    int code=-ESRCH;auto thread=_thread.lock();auto caller=thread?thread->process():nullptr;
+    if(!caller) {_sendReply(code);return;}
+    auto perform=[&]() -> int {
+        int32_t pid=_body.pid?_body.pid:static_cast<int32_t>(caller->nsid());
+        if(pid<=0)return -ESRCH;
+        auto found=processRegistry().lookupEntryByNSID(pid);auto target=found?*found:nullptr;
+        if(!target)return -ESRCH;
+        uint32_t token[8]={};
+        if(_body.audittoken && !signatureMemory(caller->id(),false,_body.audittoken,token,sizeof(token)))return -EFAULT;
+        uint32_t generation;uint64_t infoAddress=0,infoLength=0;std::string path;
+        {
+            std::shared_lock lock(target->_rwlock);
+            if(target->_dead)return -ESRCH;
+            generation=target->_pidVersion;path=target->_executablePath;
+            if(_body.audittoken && (token[5]!=static_cast<uint32_t>(pid) || token[7]!=generation))return -ESRCH;
+            if(target->_architecture!=Process::Architecture::x86_64)return -ENOTSUP;
+            dtape_task_get_dyld_info(target->_dtapeTask,&infoAddress,&infoLength);
+        }
+        switch(_body.ops) {
+            case 0:case 5:case 6:case 7:case 10:case 11:case 14:case 16:break;
+            default:return -ENOSYS; // No fabricated mutating/enforcement operations.
+        }
+        if(path.empty() || !infoAddress || infoLength<16)return -EINVAL;
+        signatureTrace("stage=begin caller-linux=%d caller-ns=%d target-linux=%d target-ns=%d op=%u generation=%u dyld=0x%llx dyld-length=%llu path=%s",
+            caller->id(),(int)caller->nsid(),target->id(),pid,_body.ops,generation,
+            (unsigned long long)infoAddress,(unsigned long long)infoLength,path.c_str());
+        auto failed=[&](const char* stage,int code) {
+            signatureTrace("stage=%s caller-linux=%d target-linux=%d target-ns=%d op=%u result=%d",
+                stage,caller->id(),target->id(),pid,_body.ops,code);return code;
+        };
+        struct {uint32_t version,count;uint64_t images;} info{};
+        struct {uint64_t header,path,modified;} first{};
+        std::array<unsigned char,32> header{};
+        if(!signatureMemory(target->id(),false,infoAddress,&info,sizeof(info)))return failed("read-dyld-info",-EAGAIN);
+        signatureTrace("stage=dyld-info target-linux=%d version=%u count=%u images=0x%llx",
+            target->id(),info.version,info.count,(unsigned long long)info.images);
+        if(!info.count || info.count>16384)return failed("dyld-image-count",-EAGAIN);
+        if(!signatureMemory(target->id(),false,info.images,&first,sizeof(first)))return failed("read-first-image",-EAGAIN);
+        signatureTrace("stage=first-image target-linux=%d header=0x%llx image-path=0x%llx modified=%llu",
+            target->id(),(unsigned long long)first.header,(unsigned long long)first.path,(unsigned long long)first.modified);
+        if(!signatureMemory(target->id(),false,first.header,header.data(),header.size()))return failed("read-image-header",-EAGAIN);
+        uint32_t commandBytes=signatureLE32(header.data()+20);
+        if(signatureLE32(header.data())!=0xfeedfacf || signatureLE32(header.data()+12)!=2 ||
+            signatureLE32(header.data()+16)>16384 || commandBytes>16*1024*1024)return -EINVAL;
+        std::vector<unsigned char> live(32+commandBytes);
+        if(!signatureMemory(target->id(),false,first.header,live.data(),live.size()))return failed("read-live-commands",-EAGAIN);
+        if(std::memcmp(live.data(),header.data(),header.size()))return failed("header-changed-before-verify",-EAGAIN);
+        int fd=open(path.c_str(),O_RDONLY|O_CLOEXEC);
+        if(fd<0)return -errno;
+        struct Close {int fd;~Close(){close(fd);}} closeFile{fd};
+        struct stat identity{};if(fstat(fd,&identity))return -errno;
+        FileSignatures::ExecutableMetadata metadata;std::string reason;
+        int error=FileSignatures::executableMetadata(fd,live,metadata,&reason);
+        if(error) {
+            signatureTrace("stage=verify-file target-linux=%d pid=%d op=%u reason=%s result=%d",target->id(),pid,_body.ops,reason.c_str(),-error);
+            return -error;
+        }
+        if(!signatureMapping(fd,target->id(),first.header,metadata.slice,identity))return failed("mapped-file-identity",-EAGAIN);
+        std::vector<unsigned char> output;int finalCode=0;
+        auto scalar=[&](const void* data,size_t length) {
+            auto bytes=static_cast<const unsigned char*>(data);output.assign(bytes,bytes+length);
+        };
+        auto blob=[&](const std::vector<unsigned char>& value) {
+            if(_body.usersize<8) {finalCode=-ERANGE;return;}
+            if(value.empty()) {output.assign(8,0);return;}
+            if(_body.usersize<value.size()) {
+                output.assign(8,0);signatureBE32(output.data()+4,value.size());finalCode=-ERANGE;
+            } else output=value;
+        };
+        if(_body.ops==0) {
+            // Actual signature validity and actual ad-hoc format only. CD flags
+            // do not prove platform identity, AMFI, hardened runtime, or grants.
+            uint32_t status=metadata.valid?(1U|(metadata.flags&2U)):0;
+            if(_body.useraddr)scalar(&status,sizeof(status));
+        } else if(_body.ops==6) scalar(&metadata.slice,sizeof(metadata.slice));
+        else if(!metadata.valid)return -EINVAL;
+        else switch(_body.ops) {
+            case 5:
+                if(_body.usersize!=metadata.cdhash.size())return -EINVAL;
+                scalar(metadata.cdhash.data(),metadata.cdhash.size());break;
+            case 7:blob(metadata.xml);break;
+            case 16:blob(metadata.der);break;
+            case 10:blob(metadata.blob);break;
+            case 11:case 14: {
+                const auto& value=_body.ops==11?metadata.identifier:metadata.team;
+                if(_body.usersize<8)return -ERANGE;
+                if(value.empty())return -ENOENT;
+                std::vector<unsigned char> identityBlob(8+value.size()+1,0);
+                signatureBE32(identityBlob.data()+4,identityBlob.size());
+                std::memcpy(identityBlob.data()+8,value.c_str(),value.size()+1);
+                blob(identityBlob);break;
+            }
+        }
+        // Re-read the live image before committing any caller-visible bytes.
+        std::vector<unsigned char> after(live.size());
+        if(!signatureMemory(target->id(),false,first.header,after.data(),after.size()))return failed("read-final-live-commands",-EAGAIN);
+        if(after!=live)return failed("header-changed-after-verify",-EAGAIN);
+        std::shared_lock lock(target->_rwlock);
+        if(target->_dead || target->_pidVersion!=generation || target->_executablePath!=path)return -ESRCH;
+        if(!output.empty() && !signatureMemory(caller->id(),true,_body.useraddr,output.data(),output.size()))return -EFAULT;
+        return finalCode;
+    };
+    try {code=perform();}catch(const std::bad_alloc&){code=-ENOMEM;}catch(...){code=-EIO;}
+    _sendReply(code);
+}
 
 void DarlingServer::Call::RegisterSimulatorDyldSignature::processCall() {
     int result = -ESRCH;

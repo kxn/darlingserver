@@ -707,6 +707,12 @@ calls.append(('mach_generate_activity_id', [
 	('activity_id', 'uint64_t*', 'uint64_t'),
 ], [], XNU_TRAP_CALL | XNU_TRAP_NOPREFIX | XNU_TRAP_NOSUFFIX))
 
+# Read-only code-signature metadata. Append only; never changes AMFI state.
+calls.append(('csops', [
+    ('pid', 'int32_t'), ('ops', 'uint32_t'), ('useraddr', 'uint64_t'),
+    ('usersize', 'uint64_t'), ('audittoken', 'uint64_t'),
+], []))
+
 ALLOWED_PRIVATE_TYPES = [
 	'bool',
 	'int8_t',
