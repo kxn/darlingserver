@@ -124,6 +124,10 @@ namespace DarlingServer {
 		std::weak_ptr<Process> _parentProcess;
 		bool _startSuspended = false;
 		bool _pendingReplacement = false;
+			// The exec monitor and main-thread checkin consume the same pipe once.
+			std::shared_ptr<FD> _execListener;
+			bool _execListenerExecutingMacho = false;
+			bool _execListenerDisclaim = false;
 		std::unordered_map<uintptr_t, std::shared_ptr<Kqchan>> _kqchannels;
 		std::unordered_map<uintptr_t, std::weak_ptr<Kqchan::Process>> _listeningKqchannels;
 		dtape_semaphore_t* _dtapeForkWaitSemaphore;
@@ -146,6 +150,9 @@ namespace DarlingServer {
 		bool _readOrWriteMemory(bool isWrite, uintptr_t remoteAddress, void* localBuffer, size_t length, int* errorCode) const;
 
 		void _notifyListeningKqchannels(uint32_t event, int64_t data);
+			enum class ExecListenerResult { NotReady, Completed, NativeExec };
+			ExecListenerResult _completeExecListenerLocked(const std::shared_ptr<FD>& expected);
+			void _setPendingReplacementLocked(bool disclaim);
 
 #if DSERVER_EXTENDED_DEBUG
 		void _registerName(uint32_t name, uintptr_t pointer);
@@ -199,7 +206,12 @@ namespace DarlingServer {
 		bool readMemory(uintptr_t remoteAddress, void* localBuffer, size_t length, int* errorCode = nullptr) const;
 		bool writeMemory(uintptr_t remoteAddress, const void* localBuffer, size_t length, int* errorCode = nullptr) const;
 
-		void notifyCheckin(Architecture architecture);
+			// Process lifecycle checkin; only the main thread may call this.
+			void notifyCheckin(Architecture architecture, bool isFork = false);
+			// The listener must already be nonblocking. Its shared FD identity is
+			// the lease shared with the original epoll monitor.
+			void setExecListener(std::shared_ptr<FD> listener, bool executingMacho, bool disclaim = false);
+			bool completeExecListener(const std::shared_ptr<FD>& expected);
 		void setPendingReplacement(bool disclaim = false);
 		Responsibility responsibility() const;
 

@@ -337,8 +337,20 @@ bool DarlingServer::Process::writeMemory(uintptr_t remoteAddress, const void* lo
 	return _readOrWriteMemory(true, remoteAddress, const_cast<void*>(localBuffer), length, errorCode);
 };
 
-void DarlingServer::Process::notifyCheckin(Architecture architecture) {
+void DarlingServer::Process::notifyCheckin(Architecture architecture, bool isFork) {
 	std::unique_lock lock(_rwlock);
+
+	// The new mldr can check in before epoll dispatches the old image's exec
+	// pipe event. Consume that same close-on-exec result before reading the flag.
+	auto execResult = _completeExecListenerLocked(_execListener);
+	if (execResult == ExecListenerResult::NotReady) {
+		throw std::system_error(EAGAIN, std::generic_category(), "Exec listener is not complete at main-thread checkin");
+	}
+	if (execResult == ExecListenerResult::NativeExec) {
+		lock.unlock();
+		notifyDead();
+		throw std::system_error(ESRCH, std::generic_category(), "Native exec cannot check in as a Darling process");
+	}
 
 	bool didExec = _pendingReplacement;
 
@@ -428,7 +440,7 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 	if (didExec) {
 		// notify listeners that we have exec'd (i.e. been replaced)
 		_notifyListeningKqchannels(NOTE_EXEC, 0);
-	} else {
+	} else if (isFork) {
 		// notify the parent process (if we have one) that we've arrived
 		if (auto parent = _parentProcess.lock()) {
 			dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
@@ -437,9 +449,74 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 	}
 };
 
-void DarlingServer::Process::setPendingReplacement(bool disclaim) {
-	std::unique_lock lock(_rwlock);
+DarlingServer::Process::ExecListenerResult DarlingServer::Process::_completeExecListenerLocked(const std::shared_ptr<FD>& expected) {
+	// A late callback for a pipe already consumed by checkin must not mark the
+	// replacement pending again (or consume a subsequent exec's pipe).
+	if (!expected || _execListener != expected) {
+		return ExecListenerResult::Completed;
+	}
+	if (_dead) {
+		_execListener.reset();
+		return ExecListenerResult::Completed;
+	}
 
+	char failure;
+	ssize_t result;
+	do {
+		result = read(expected->fd(), &failure, sizeof(failure));
+	} while (result < 0 && errno == EINTR);
+	if (result < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			return ExecListenerResult::NotReady;
+		}
+		throw std::system_error(errno, std::generic_category(), "Failed to read from exec listener pipe");
+	}
+
+	auto completed = ExecListenerResult::Completed;
+	if (result == 0) {
+		if (_execListenerExecutingMacho) {
+			_setPendingReplacementLocked(_execListenerDisclaim);
+		} else {
+			completed = ExecListenerResult::NativeExec;
+		}
+	}
+	// A failure byte leaves the old task and responsibility untouched.
+	_execListener.reset();
+	return completed;
+};
+
+void DarlingServer::Process::setExecListener(std::shared_ptr<FD> listener, bool executingMacho, bool disclaim) {
+	std::unique_lock lock(_rwlock);
+	if (_dead) {
+		throw std::system_error(ESRCH, std::generic_category(), "Cannot register exec for a dead process");
+	}
+	// A failed exec can be followed immediately by another checkout before its
+	// monitor runs. Finish the ready old pipe without replacing an in-flight one.
+	auto previous = _completeExecListenerLocked(_execListener);
+	if (previous == ExecListenerResult::NotReady) {
+		throw std::system_error(EBUSY, std::generic_category(), "Previous exec listener is still pending");
+	}
+	if (previous == ExecListenerResult::NativeExec) {
+		lock.unlock();
+		notifyDead();
+		throw std::system_error(ESRCH, std::generic_category(), "Process completed a native exec");
+	}
+	_execListener = std::move(listener);
+	_execListenerExecutingMacho = executingMacho;
+	_execListenerDisclaim = disclaim;
+};
+
+bool DarlingServer::Process::completeExecListener(const std::shared_ptr<FD>& expected) {
+	std::unique_lock lock(_rwlock);
+	auto result = _completeExecListenerLocked(expected);
+	lock.unlock();
+	if (result == ExecListenerResult::NativeExec) {
+		notifyDead();
+	}
+	return result != ExecListenerResult::NotReady;
+};
+
+void DarlingServer::Process::_setPendingReplacementLocked(bool disclaim) {
 	processLog.info() << "Process " << id() << " (" << nsid() << ") is now pending replacement" << processLog.endLog;
 
 	_pendingReplacement = true;
@@ -448,6 +525,11 @@ void DarlingServer::Process::setPendingReplacement(bool disclaim) {
 		// never arrive here and cannot change the old process's responsibility.
 		_responsibility = {_nspid, _uniqueID, _eid};
 	}
+};
+
+void DarlingServer::Process::setPendingReplacement(bool disclaim) {
+	std::unique_lock lock(_rwlock);
+	_setPendingReplacementLocked(disclaim);
 };
 
 DarlingServer::Process::Responsibility DarlingServer::Process::responsibility() const {

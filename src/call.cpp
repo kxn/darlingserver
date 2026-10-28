@@ -302,9 +302,15 @@ void DarlingServer::Call::Checkin::processCall() {
 
 	if (auto thread = _thread.lock()) {
 		if (auto process = thread->process()) {
-			// the process needs to know when the checkin occurs, in case it has a pending replacement
-			// and also to notify its parent about when the fork is complete
-			process->notifyCheckin(static_cast<Process::Architecture>(_header.architecture));
+			// A pthread checkin registers only that thread. It must not consume
+			// an exec replacement or emit another process-level fork notification.
+			if (_header.pid == _header.tid) {
+				try {
+					process->notifyCheckin(static_cast<Process::Architecture>(_header.architecture), _body.is_fork);
+				} catch (const std::system_error& error) {
+					code = -error.code().value();
+				}
+			}
 		} else {
 			code = -ESRCH;
 		}
@@ -337,41 +343,28 @@ int DarlingServer::Call::_checkout(int& execListener, bool executingMacho, bool 
 						auto fd = std::make_shared<FD>(execListener);
 						execListener = -1; // the FD instance now owns the descriptor
 
-						auto replacingWithDarlingProcess = executingMacho;
+						try {
+							process->setExecListener(fd, executingMacho, disclaim);
+						} catch (const std::system_error& error) {
+							code = -error.code().value();
+						}
+						if (code == 0) {
+							std::weak_ptr<Process> weakProcess = process;
+							Server::sharedInstance().addMonitor(std::make_shared<Monitor>(fd, Monitor::Event::HangUp, false, true, [fd, weakProcess](std::shared_ptr<Monitor> monitor, Monitor::Event events) {
+									Server::sharedInstance().removeMonitor(monitor);
 
-						std::weak_ptr<Process> weakProcess = process;
-						Server::sharedInstance().addMonitor(std::make_shared<Monitor>(fd, Monitor::Event::HangUp, false, true, [fd, weakProcess, replacingWithDarlingProcess, disclaim](std::shared_ptr<Monitor> monitor, Monitor::Event events) {
-							Server::sharedInstance().removeMonitor(monitor);
+									auto process = weakProcess.lock();
 
-							auto process = weakProcess.lock();
+									if (!process) {
+										// the process died...
+										return;
+									}
 
-							if (!process) {
-								// the process died...
-								return;
-							}
-
-							char tmp;
-							int result = read(fd->fd(), &tmp, sizeof(tmp));
-
-							if (result < 0) {
-								// we shouldn't even get EAGAIN
-								throw std::system_error(errno, std::generic_category(), "Failed to read from exec listener pipe");
-							}
-
-							if (result == 0) {
-								// the execve succeeded
-								if (replacingWithDarlingProcess) {
-									process->setPendingReplacement(disclaim);
-								} else {
-									// the Darling process was replaced with a non-Darling process
-									// treat it like death
-									process->notifyDead();
-								}
-							} else {
-								// the execve failed
-								// do nothing in this case
-							}
-						}));
+									if (!process->completeExecListener(fd)) {
+										throw std::system_error(EAGAIN, std::generic_category(), "Exec listener hangup without completion");
+									}
+							}));
+						}
 					}
 				}
 			} else {
